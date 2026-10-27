@@ -49,6 +49,7 @@ def carve_region(
     progress_cb: ProgressCb = None,
     cancel_cb: CancelCb = None,
     chunk_size: int = 1024 * 1024,
+    telemetry_cb: Optional[Callable[..., None]] = None,
 ) -> List[CarvedFile]:
     """Skanuj zakres bajtów (w przestrzeni obrazu) pod kątem sygnatur."""
     skip = skip_offsets or set()
@@ -131,6 +132,11 @@ def carve_region(
             )
         prev_tail = chunk[-overlap:] if len(chunk) >= overlap else chunk
         scanned += len(chunk)
+        if telemetry_cb:
+            telemetry_cb(
+                bytes_read=len(chunk),
+                operation=f"Wyszukiwanie RAW: offset {pos}",
+            )
         if progress_cb:
             pct = int(100 * scanned / max(length, 1))
             progress_cb(min(99, pct), f"Carving RAW… {len(results)} plików")
@@ -157,6 +163,7 @@ def carve_unallocated(
     known_file_offsets: Optional[Set[int]] = None,
     progress_cb: ProgressCb = None,
     cancel_cb: CancelCb = None,
+    telemetry_cb: Optional[Callable[..., None]] = None,
 ) -> List[CarvedFile]:
     """Carving obszaru danych — użytkownik może ograniczyć do niezaalokowanych."""
     data_len = vol.bpb.total_sectors * vol.bpb.bytes_per_sector - (
@@ -171,6 +178,7 @@ def carve_unallocated(
         skip_offsets=known_file_offsets,
         progress_cb=progress_cb,
         cancel_cb=cancel_cb,
+        telemetry_cb=telemetry_cb,
     )
 
 

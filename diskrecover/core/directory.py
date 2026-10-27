@@ -183,11 +183,14 @@ def read_directory(
     *,
     include_deleted: bool = True,
     max_clusters: int = 4096,
+    visited_clusters: Optional[set[int]] = None,
 ) -> List[DirEntry]:
     chain = vol.follow_chain(start_cluster, max_clusters=max_clusters)
     if not chain and start_cluster >= 2:
         # Uszkodzony łańcuch — spróbuj przynajmniej pierwszego klastra
         chain = [start_cluster]
+    if visited_clusters is not None:
+        visited_clusters.update(chain)
     entries: List[DirEntry] = []
     for c in chain:
         data = vol.read_cluster(c)
@@ -200,6 +203,17 @@ def read_directory(
             if e.is_volume_label:
                 continue
             entries.append(e)
+            if vol.activity_cb:
+                vol.activity_cb(
+                    directory_entries=1,
+                    files_found=0 if e.is_directory else 1,
+                    directories_found=1 if e.is_directory else 0,
+                    entry_offset=e.raw_offset,
+                )
+        if vol.activity_cb:
+            vol.activity_cb(
+                operation=f"Odczyt katalogu klastra {c}",
+            )
     return entries
 
 

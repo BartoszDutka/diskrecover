@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QThread, Signal
+import time
 
 from diskrecover.core.recovery import RecoveryEngine, RecoverySession
+from diskrecover.core.telemetry import log_exception
 
 
 class AnalyzeWorker(QThread):
@@ -49,11 +51,14 @@ class AnalyzeWorker(QThread):
                 self.progress.emit(100, "Analiza zakończona")
                 self.finished_ok.emit(summary)
         except Exception as e:
+            if self.engine.logger:
+                log_exception(self.engine.logger, "Błąd skanowania")
             self.failed.emit(str(e))
 
 
 class RecoverWorker(QThread):
     progress = Signal(int, str)
+    telemetry = Signal(object)
     finished_ok = Signal(object)
     failed = Signal(str)
 
@@ -75,14 +80,28 @@ class RecoverWorker(QThread):
             enable_raw=enable_raw,
             deep_scan=deep_scan,
         )
+        self._last_telemetry_emit = 0.0
+        self._last_stage = ""
 
     def cancel(self) -> None:
         self.engine.request_cancel()
 
     def run(self) -> None:
         try:
+            def emit_telemetry(snapshot) -> None:
+                now = time.monotonic()
+                if (
+                    now - self._last_telemetry_emit >= 0.5
+                    or snapshot.stage != self._last_stage
+                    or snapshot.status in ("zakończone", "błąd")
+                ):
+                    self._last_telemetry_emit = now
+                    self._last_stage = snapshot.stage
+                    self.telemetry.emit(snapshot)
+
             session = self.engine.run(
-                progress_cb=lambda p, m: self.progress.emit(p, m)
+                progress_cb=lambda p, m: self.progress.emit(p, m),
+                telemetry_cb=emit_telemetry,
             )
             self.finished_ok.emit(session)
         except InterruptedError:

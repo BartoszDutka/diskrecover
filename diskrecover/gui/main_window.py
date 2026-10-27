@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -43,6 +43,8 @@ class MainWindow(QMainWindow):
         self._analyze_worker: AnalyzeWorker | None = None
         self._recover_worker: RecoverWorker | None = None
         self._session = None
+        self._last_snapshot = None
+        self._scan_started_at = 0.0
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -160,6 +162,18 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         v.addWidget(self.progress)
+        self.stage_progress = QProgressBar()
+        self.stage_progress.setRange(0, 100)
+        self.stage_progress.setFormat("Postęp bieżącego etapu")
+        v.addWidget(self.stage_progress)
+
+        self.scanner_indicator = QLabel("● GOTOWY")
+        self.scanner_indicator.setStyleSheet("color: #7dd3c0; font-weight: bold")
+        v.addWidget(self.scanner_indicator)
+        self.scan_stats = QLabel("Brak aktywnego skanowania.")
+        self.scan_stats.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.scan_stats.setWordWrap(True)
+        v.addWidget(self.scan_stats)
 
         self.scan_status = QLabel("Oczekiwanie…")
         v.addWidget(self.scan_status)
@@ -178,6 +192,9 @@ class MainWindow(QMainWindow):
         self.btn_cancel.clicked.connect(self._cancel_recover)
         row.addWidget(self.btn_start)
         row.addWidget(self.btn_cancel)
+        self.btn_open_log = QPushButton("Otwórz log diagnostyczny")
+        self.btn_open_log.clicked.connect(self._open_log)
+        row.addWidget(self.btn_open_log)
         row.addStretch()
         v.addLayout(row)
         return w
@@ -316,9 +333,15 @@ class MainWindow(QMainWindow):
             self.chk_deep.isChecked(),
         )
         self._recover_worker.progress.connect(self._on_recover_progress)
+        self._recover_worker.telemetry.connect(self._on_telemetry)
         self._recover_worker.finished_ok.connect(self._on_recover_ok)
         self._recover_worker.failed.connect(self._on_recover_fail)
         self._recover_worker.start()
+        self._scan_started_at = __import__("time").monotonic()
+        if not hasattr(self, "_heartbeat_timer"):
+            self._heartbeat_timer = QTimer(self)
+            self._heartbeat_timer.timeout.connect(self._check_heartbeat)
+        self._heartbeat_timer.start(1000)
 
     def _cancel_recover(self) -> None:
         if self._recover_worker:
@@ -326,11 +349,18 @@ class MainWindow(QMainWindow):
             self.scan_status.setText("Anulowanie…")
 
     def _on_recover_progress(self, pct: int, msg: str) -> None:
-        self.progress.setValue(pct)
+        if pct < 0:
+            self.progress.setRange(0, 0)
+        else:
+            if self.progress.maximum() == 0:
+                self.progress.setRange(0, 100)
+            self.progress.setValue(pct)
         self.scan_status.setText(msg)
         self.scan_log.append(f"[{pct}%] {msg}")
 
     def _on_recover_ok(self, session) -> None:
+        if hasattr(self, "_heartbeat_timer"):
+            self._heartbeat_timer.stop()
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self._session = session
@@ -344,11 +374,67 @@ class MainWindow(QMainWindow):
         )
 
     def _on_recover_fail(self, err: str) -> None:
+        if hasattr(self, "_heartbeat_timer"):
+            self._heartbeat_timer.stop()
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.status.setText("Błąd / anulowano.")
         self.scan_log.append(f"BŁĄD: {err}")
         QMessageBox.warning(self, "DiskRecover", err)
+
+    def _on_telemetry(self, snapshot) -> None:
+        self._last_snapshot = snapshot
+        self._update_scan_stats(snapshot)
+
+    def _update_scan_stats(self, snapshot) -> None:
+        total = max(snapshot.clusters_total, 1)
+        stage_pct = int(100 * snapshot.clusters_checked / total)
+        self.stage_progress.setValue(min(100, stage_pct))
+        elapsed = max(0.0, __import__("time").monotonic() - snapshot.started_at)
+        age = max(0.0, __import__("time").monotonic() - snapshot.last_activity)
+        mb = snapshot.bytes_read / (1024 * 1024)
+        speed = mb / elapsed if elapsed else 0.0
+        self.scan_stats.setText(
+            f"Etap: {snapshot.stage}\n"
+            f"Operacja: {snapshot.operation}\n"
+            f"Przeanalizowane klastry: {snapshot.clusters_checked:,} / "
+            f"{snapshot.clusters_total:,}\n"
+            f"Aktualny klaster: {snapshot.cluster or '-'} | "
+            f"LBA: {snapshot.lba or '-'}\n"
+            f"Przeczytane dane: {mb:,.2f} MB | Prędkość: {speed:,.1f} MB/s\n"
+            f"Wpisy katalogowe: {snapshot.directory_entries:,} | "
+            f"Katalogi: {snapshot.directories_found:,} | "
+            f"Pliki: {snapshot.files_found:,} | "
+            f"Uszkodzenia: {snapshot.corruptions:,}\n"
+            f"Czas: {elapsed:,.1f} s | Ostatnia aktywność: {age:,.1f} s temu"
+        )
+        self.scanner_indicator.setText("● SKANOWANIE")
+        self.scanner_indicator.setStyleSheet("color: #7dd3c0; font-weight: bold")
+
+    def _check_heartbeat(self) -> None:
+        snapshot = self._last_snapshot
+        if snapshot is None:
+            return
+        age = __import__("time").monotonic() - snapshot.last_activity
+        if age >= 30:
+            self.scanner_indicator.setText("● BRAK AKTYWNOŚCI — SPRAWDŹ LOG")
+            self.scanner_indicator.setStyleSheet("color: #f0ad4e; font-weight: bold")
+            self.scan_log.append(
+                f"DIAGNOSTYKA: brak heartbeat przez {age:.1f} s; "
+                "proces nie został automatycznie uznany za zawieszony."
+            )
+        elif age >= 3:
+            self.scanner_indicator.setText("● AKTYWNE, BEZ NOWYCH WYNIKÓW")
+            self.scanner_indicator.setStyleSheet("color: #f0ad4e; font-weight: bold")
+        elif snapshot.status == "zakończone":
+            self.scanner_indicator.setText("● ZAKOŃCZONE")
+
+    def _open_log(self) -> None:
+        path = Path(self.out_edit.text().strip()) / "Raport" / "scanner_debug.log"
+        if path.is_file():
+            self._open_path(str(path))
+        else:
+            QMessageBox.information(self, "DiskRecover", "Log zostanie utworzony po rozpoczęciu skanowania.")
 
     def _fill_results(self, session) -> None:
         s = session.stats

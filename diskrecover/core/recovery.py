@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
+import logging
+import time
 
 from diskrecover.core.directory import names_match, read_directory
 from diskrecover.core.fat32 import Fat32Volume
@@ -23,6 +25,12 @@ from diskrecover.core.reconstruction import (
     reconstruct_target,
 )
 from diskrecover.core.report import write_reports
+from diskrecover.core.telemetry import (
+    ScanSnapshot,
+    ScanTelemetry,
+    create_scanner_logger,
+    log_exception,
+)
 
 
 OUTPUT_DIRS = (
@@ -71,6 +79,7 @@ class RecoverySession:
 
 ProgressCb = Optional[Callable[[int, str], None]]
 CancelCb = Optional[Callable[[], bool]]
+TelemetryCb = Optional[Callable[[ScanSnapshot], None]]
 
 
 class RecoveryEngine:
@@ -96,6 +105,8 @@ class RecoveryEngine:
         self.reader: Optional[ImageReader] = None
         self.volume: Optional[Fat32Volume] = None
         self.session: Optional[RecoverySession] = None
+        self.telemetry: Optional[ScanTelemetry] = None
+        self.logger: Optional[logging.Logger] = None
 
     def request_cancel(self) -> None:
         self._cancel = True
@@ -141,15 +152,116 @@ class RecoveryEngine:
             )
         return self.volume
 
-    def run(self, progress_cb: ProgressCb = None) -> RecoverySession:
+    def run(
+        self,
+        progress_cb: ProgressCb = None,
+        telemetry_cb: TelemetryCb = None,
+    ) -> RecoverySession:
         self._cancel = False
         self._prepare_output()
+        self.logger = create_scanner_logger(self.output_dir)
+        self.telemetry = ScanTelemetry(
+            self.image_path.stat().st_size if self.image_path.is_file() else 0,
+            on_update=telemetry_cb,
+        )
+        self.logger.info("Rozpoczęcie skanowania obrazu: %s", self.image_path)
+        last_log_at = 0.0
+        last_log_cluster = -1
+        seen_entry_offsets: Set[int] = set()
+        def telemetry_event(**changes: object) -> None:
+            nonlocal last_log_at, last_log_cluster
+            entry_offset = changes.pop("entry_offset", None)
+            if self.telemetry:
+                additive = (
+                    "bytes_read",
+                    "directory_entries",
+                    "directories_found",
+                    "files_found",
+                    "corruptions",
+                )
+                increments = {
+                    key: int(changes.pop(key))
+                    for key in additive
+                    if key in changes
+                }
+                if isinstance(entry_offset, int):
+                    if entry_offset in seen_entry_offsets:
+                        increments.pop("directory_entries", None)
+                        increments.pop("directories_found", None)
+                        increments.pop("files_found", None)
+                    else:
+                        seen_entry_offsets.add(entry_offset)
+                for key, amount in increments.items():
+                    self.telemetry.increment(key, amount)
+                if changes:
+                    self.telemetry.update(**changes)
+            cluster = changes.get("cluster")
+            now = time.monotonic()
+            should_log = (
+                bool(changes.get("operation"))
+                and (
+                    now - last_log_at >= 2.0
+                    or (
+                        isinstance(cluster, int)
+                        and abs(cluster - last_log_cluster) >= 4096
+                    )
+                )
+            )
+            if self.logger and should_log:
+                self.logger.info(
+                    "operation=%s cluster=%s lba=%s",
+                    changes.get("operation"),
+                    cluster,
+                    changes.get("lba"),
+                )
+                last_log_at = now
+                if isinstance(cluster, int):
+                    last_log_cluster = cluster
+        self._telemetry_event = telemetry_event
+        if self.telemetry:
+            self.telemetry.update(status="skanowanie", stage="Otwarcie i walidacja obrazu")
         vol = self.open_volume(progress_cb)
+        vol.activity_cb = telemetry_event
+        if self.telemetry:
+            self.telemetry.update(
+                stage="Odczyt BPB i tablic FAT",
+                clusters_total=vol.total_clusters,
+                operation="BPB zweryfikowane",
+            )
+        if progress_cb:
+            progress_cb(9, "Ładuję tablicę FAT (jeden odczyt strumieniowy)…")
+        last_fat_pct = -1
+        def fat_progress(pct: int) -> None:
+            nonlocal last_fat_pct
+            if pct != last_fat_pct and progress_cb:
+                last_fat_pct = pct
+                progress_cb(
+                    9 + int(pct * 0.01),
+                    f"Ładuję tablicę FAT (postęp {pct}%)…",
+                )
+        vol.preload_fat(
+            progress_cb=fat_progress if progress_cb else None,
+            cancel_cb=self._cancelled,
+        )
 
         def wrap_progress(pct: int, msg: str) -> None:
             # Skaluj fazę rekonstrukcji do 10–55
             if progress_cb:
-                progress_cb(10 + int(pct * 0.45), msg)
+                progress_cb(
+                    -1 if pct < 0 else 10 + int(pct * 0.45),
+                    msg,
+                )
+            if self.logger:
+                self.logger.info("postęp=%s%% %s", pct, msg)
+            if self.telemetry:
+                stage = "Wyszukiwanie folderu docelowego"
+                if "osieroc" in msg.lower():
+                    stage = "Skanowanie osieroconych katalogów"
+                elif "klastr" in msg.lower():
+                    stage = "Głębokie skanowanie klastrów"
+                elif "drzew" in msg.lower():
+                    stage = "Rekonstrukcja znalezionych plików"
+                self.telemetry.update(stage=stage, operation=msg)
 
         recon = reconstruct_target(
             vol,
@@ -157,6 +269,7 @@ class RecoveryEngine:
             progress_cb=wrap_progress,
             cancel_cb=self._cancelled,
             deep_scan=self.deep_scan,
+            telemetry_cb=self._telemetry_event,
         )
 
         items: List[RecoveryItem] = []
@@ -164,7 +277,9 @@ class RecoveryEngine:
 
         # Eksport drzewa docelowego
         if progress_cb:
-            progress_cb(55, "Eksportuję pliki z katalogu docelowego…")
+            progress_cb(55, "Rekonstruuję znalezione pliki…")
+        if self.telemetry:
+            self.telemetry.update(stage="Rekonstrukcja znalezionych plików")
         target_root = self.output_dir / "Odtworzony_bhp_szkoly"
         items.extend(
             self._export_tree(
@@ -216,6 +331,7 @@ class RecoveryEngine:
                 known_file_offsets=known_offsets,
                 progress_cb=raw_prog,
                 cancel_cb=self._cancelled,
+                telemetry_cb=self._telemetry_event,
             )
             raw_dir = self.output_dir / "RAW"
             for cf in carved:
@@ -252,11 +368,17 @@ class RecoveryEngine:
 
         if progress_cb:
             progress_cb(95, "Generuję raporty…")
+        if self.telemetry:
+            self.telemetry.update(stage="Generowanie wyników i raportu")
         write_reports(session, self.output_dir / "Raport")
 
         if progress_cb:
             progress_cb(100, "Gotowe")
         self.session = session
+        if self.telemetry:
+            self.telemetry.update(status="zakończone", stage="Zakończone", operation="Gotowe")
+        if self.logger:
+            self.logger.info("Skanowanie zakończone: %s", session.stats)
         return session
 
     def _export_other_root_entries(

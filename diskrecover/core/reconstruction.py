@@ -70,20 +70,47 @@ def find_named_directories(
     progress_cb: ProgressCb = None,
     cancel_cb: CancelCb = None,
     deep_scan: bool = True,
+    telemetry_cb: Optional[Callable[..., None]] = None,
+    orphan_candidates: Optional[List[int]] = None,
 ) -> List[DirEntry]:
     """Szukaj katalogów o danej nazwie — najpierw drzewo, potem skan klastrów."""
     found: List[DirEntry] = []
     visited: Set[int] = set()
+    last_tree_report = 0
 
     def walk(cluster: int, depth: int = 0) -> None:
+        nonlocal last_tree_report
         _check_cancel(cancel_cb)
         if cluster in visited or depth > 64:
             return
         visited.add(cluster)
+        if telemetry_cb:
+            telemetry_cb(
+                clusters_checked=len(visited),
+                cluster=cluster,
+                operation=f"Wyszukiwanie katalogu: klaster {cluster}",
+            )
+        if progress_cb and len(visited) - last_tree_report >= 4096:
+            last_tree_report = len(visited)
+            progress_cb(
+                -1,
+                f"Szukam katalogu „{target_name}”… "
+                f"(odwiedzono {len(visited):,} klastrów)",
+            )
         try:
-            entries = read_directory(vol, cluster)
+            entries = read_directory(
+                vol,
+                cluster,
+                visited_clusters=visited,
+            )
         except Exception:
             return
+        if telemetry_cb:
+            telemetry_cb(
+                clusters_checked=len(visited),
+                cluster=cluster,
+                operation=f"Łańcuch katalogu: {len(visited)} unikalnych klastrów",
+            )
         for e in entries:
             if e.is_dot or e.cluster < 2:
                 continue
@@ -109,12 +136,31 @@ def find_named_directories(
         if progress_cb and i % step == 0:
             pct = 20 + int(50 * i / max(total, 1))
             progress_cb(min(70, pct), f"Skan klastrów pod „{target_name}”…")
+        if c in visited:
+            continue
+        visited.add(c)
+        if telemetry_cb:
+            telemetry_cb(
+                clusters_checked=len(visited),
+                cluster=c,
+                operation=f"Głębokie wyszukiwanie katalogu: klaster {c}",
+            )
         try:
             data = vol.read_cluster(c)
         except Exception:
             continue
         if not looks_like_directory_cluster(data):
             continue
+        self_cluster = int.from_bytes(data[26:28], "little") | (
+            int.from_bytes(data[20:22], "little") << 16
+        )
+        if (
+            orphan_candidates is not None
+            and data[0:1] == b"."
+            and data[11] == 0x10
+            and self_cluster == c
+        ):
+            orphan_candidates.append(c)
         ents = parse_entries_from_buffer(data, vol.cluster_offset(c), parent_cluster=c)
         for e in ents:
             if e.is_directory and names_match(e.name, target_name) and e.cluster >= 2:
@@ -141,7 +187,12 @@ def build_tree_from_directory(
     visited.add(start_cluster)
     nodes: List[RecoveredNode] = []
     try:
-        entries = read_directory(vol, start_cluster, include_deleted=True)
+        entries = read_directory(
+            vol,
+            start_cluster,
+            include_deleted=True,
+            visited_clusters=visited,
+        )
     except Exception:
         return []
 
@@ -201,15 +252,28 @@ def find_orphan_directories(
     *,
     progress_cb: ProgressCb = None,
     cancel_cb: CancelCb = None,
+    telemetry_cb: Optional[Callable[..., None]] = None,
+    candidate_clusters: Optional[List[int]] = None,
 ) -> List[RecoveredNode]:
     """Katalogi z . / .. niepowiązane ze znanym drzewem."""
     orphans: List[RecoveredNode] = []
-    total = vol.total_clusters
+    candidates = (
+        candidate_clusters
+        if candidate_clusters is not None
+        else range(2, vol.total_clusters + 2)
+    )
+    total = len(candidates) if candidate_clusters is not None else vol.total_clusters
     step = max(1, total // 50)
-    for i, c in enumerate(range(2, total + 2)):
+    for i, c in enumerate(candidates):
         _check_cancel(cancel_cb)
         if c in known_clusters:
             continue
+        if telemetry_cb:
+            telemetry_cb(
+                clusters_checked=i + 1,
+                cluster=c,
+                operation=f"Skanowanie osieroconych katalogów: klaster {c}",
+            )
         if progress_cb and i % step == 0:
             progress_cb(70 + int(25 * i / max(total, 1)), "Szukanie osieroconych katalogów…")
         try:
@@ -255,13 +319,21 @@ def reconstruct_target(
     progress_cb: ProgressCb = None,
     cancel_cb: CancelCb = None,
     deep_scan: bool = True,
+    telemetry_cb: Optional[Callable[..., None]] = None,
 ) -> ReconstructionResult:
     messages: List[str] = []
+    orphan_candidates: List[int] = []
     if progress_cb:
         progress_cb(5, f"Szukam katalogu „{target_name}”…")
 
     matches = find_named_directories(
-        vol, target_name, progress_cb=progress_cb, cancel_cb=cancel_cb, deep_scan=deep_scan
+        vol,
+        target_name,
+        progress_cb=progress_cb,
+        cancel_cb=cancel_cb,
+        deep_scan=deep_scan,
+        telemetry_cb=telemetry_cb,
+        orphan_candidates=orphan_candidates,
     )
     nodes: List[RecoveredNode] = []
     target_cluster: Optional[int] = None
@@ -304,7 +376,12 @@ def reconstruct_target(
         )
 
     orphans = find_orphan_directories(
-        vol, known, progress_cb=progress_cb, cancel_cb=cancel_cb
+        vol,
+        known,
+        progress_cb=progress_cb,
+        cancel_cb=cancel_cb,
+        telemetry_cb=telemetry_cb,
+        candidate_clusters=orphan_candidates if deep_scan else None,
     )
     # Orphany z nazwą zawierającą target — oznacz jako możliwe (MEDIUM), ale
     # belongs_to_target tylko przy names_match w dzieciach/ścieżce z dowodem

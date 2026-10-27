@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from diskrecover.core.image import ImageReader
 
@@ -152,6 +152,7 @@ class Fat32Volume:
     bpb: Fat32BPB
     _fat_cache: Dict[int, int] = field(default_factory=dict, repr=False)
     _fat_loaded: bool = field(default=False, repr=False)
+    activity_cb: Optional[Callable[..., None]] = field(default=None, repr=False)
 
     @classmethod
     def open(
@@ -207,7 +208,14 @@ class Fat32Volume:
         return self.data_offset + (cluster - 2) * self.cluster_size
 
     def read_cluster(self, cluster: int) -> bytes:
-        return self.reader.read(self.cluster_offset(cluster), self.cluster_size)
+        data = self.reader.read(self.cluster_offset(cluster), self.cluster_size)
+        if self.activity_cb:
+            self.activity_cb(
+                bytes_read=len(data),
+                cluster=cluster,
+                lba=self.cluster_offset(cluster) // self.bpb.bytes_per_sector,
+            )
+        return data
 
     def fat_entry(self, cluster: int) -> int:
         if cluster in self._fat_cache:
@@ -215,6 +223,12 @@ class Fat32Volume:
         # FAT32: 4 bajty na wpis
         off = self.fat_offset + cluster * 4
         raw = self.reader.read(off, 4)
+        if self.activity_cb:
+            self.activity_cb(
+                bytes_read=len(raw),
+                cluster=cluster,
+                lba=off // self.bpb.bytes_per_sector,
+            )
         if len(raw) < 4:
             return FREE_CLUSTER
         val = int.from_bytes(raw, "little") & 0x0FFFFFFF
@@ -251,6 +265,8 @@ class Fat32Volume:
         limit = max_clusters if max_clusters is not None else self.total_clusters + 2
         while c >= 2 and c < EOC_MIN and c != BAD_CLUSTER:
             if c in seen:
+                if self.activity_cb:
+                    self.activity_cb(corruptions=1, operation=f"Cykl FAT przy klastrze {c}")
                 break  # pętla
             seen.add(c)
             chain.append(c)

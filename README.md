@@ -63,6 +63,26 @@ Testy używają **syntetycznych obrazów FAT32** — nie potrzeba prawdziwego pe
 pytest -q
 ```
 
+### Diagnostyka długiego skanowania
+
+Podczas odzyskiwania aplikacja wykonuje rzeczywisty skan w workerze `QThread`.
+Zakładka „Skanowanie” pokazuje liczniki odczytów obrazu, klastrów, wpisów
+katalogowych i uszkodzeń FAT. Pasek etapu może pozostać nieokreślony, gdy
+liczby operacji nie da się wiarygodnie wyznaczyć — aplikacja nie udaje wtedy
+procentowego postępu.
+
+Po rozpoczęciu skanowania tworzony jest:
+
+```text
+<katalog-wyjściowy>\Raport\scanner_debug.log
+```
+
+Log jest zapisywany na bieżąco. Brak heartbeat przez 30 sekund powoduje
+ostrzeżenie diagnostyczne, ale nie kończy ani nie oznacza automatycznie procesu
+jako zawieszonego. Łańcuchy FAT mają limit wynikający z liczby klastrów
+woluminu oraz zbiór odwiedzonych klastrów, więc cykliczne referencje są
+przerywane.
+
 ## Budowa .exe (PyInstaller)
 
 Na Windows:
