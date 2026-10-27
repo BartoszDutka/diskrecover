@@ -220,8 +220,15 @@ class Fat32Volume:
     def fat_entry(self, cluster: int) -> int:
         if cluster in self._fat_cache:
             return self._fat_cache[cluster]
+        val = self.fat_entry_copy(0, cluster)
+        self._fat_cache[cluster] = val
+        return val
+
+    def fat_entry_copy(self, copy_index: int, cluster: int) -> int:
+        if copy_index < 0 or copy_index >= self.bpb.num_fats:
+            raise ValueError(f"Nieprawidłowy indeks kopii FAT: {copy_index}")
         # FAT32: 4 bajty na wpis
-        off = self.fat_offset + cluster * 4
+        off = self.fat_offset + copy_index * self.fat_bytes + cluster * 4
         raw = self.reader.read(off, 4)
         if self.activity_cb:
             self.activity_cb(
@@ -232,7 +239,6 @@ class Fat32Volume:
         if len(raw) < 4:
             return FREE_CLUSTER
         val = int.from_bytes(raw, "little") & 0x0FFFFFFF
-        self._fat_cache[cluster] = val
         return val
 
     def preload_fat(self, progress_cb=None, cancel_cb=None) -> None:

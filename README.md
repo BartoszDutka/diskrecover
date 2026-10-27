@@ -83,6 +83,12 @@ jako zawieszonego. Łańcuchy FAT mają limit wynikający z liczby klastrów
 woluminu oraz zbiór odwiedzonych klastrów, więc cykliczne referencje są
 przerywane.
 
+Parser katalogów odrzuca rekordy z nieprawidłowymi atrybutami, klastrami poza
+zakresem, błędnymi rekordami LFN i niespójnymi wpisami `.`/`..`. Przypadkowy
+klaster nie jest uznawany za katalog tylko dlatego, że zawiera znaki
+przypominające rekordy 32-bajtowe. Panel skanowania pokazuje osobno rekordy
+sprawdzone, odrzucone, poprawne oraz kandydatów.
+
 ## Budowa .exe (PyInstaller)
 
 Na Windows:

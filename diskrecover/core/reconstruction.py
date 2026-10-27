@@ -41,6 +41,7 @@ class RecoveredNode:
     source_entry: Optional[DirEntry] = None
     belongs_to_target: bool = False  # True tylko przy dowodach
     children: List["RecoveredNode"] = field(default_factory=list)
+    is_candidate: bool = False
 
 
 @dataclass
@@ -61,6 +62,27 @@ CancelCb = Optional[Callable[[], bool]]
 def _check_cancel(cancel_cb: CancelCb) -> None:
     if cancel_cb and cancel_cb():
         raise InterruptedError("Anulowano skanowanie")
+
+
+def _confirmed_directory_cluster(vol: Fat32Volume, cluster: int) -> bool:
+    if cluster < 2 or cluster > vol.total_clusters + 1:
+        return False
+    chain = vol.follow_chain(cluster)
+    if not chain or chain[0] != cluster:
+        return False
+    if vol.bpb.num_fats >= 2 and (
+        vol.fat_entry_copy(0, cluster) != vol.fat_entry_copy(1, cluster)
+    ):
+        return False
+    try:
+        data = vol.read_cluster(cluster)
+    except Exception:
+        return False
+    return looks_like_directory_cluster(
+        data,
+        cluster=cluster,
+        max_cluster=vol.total_clusters + 1,
+    )
 
 
 def find_named_directories(
@@ -115,9 +137,19 @@ def find_named_directories(
             if e.is_dot or e.cluster < 2:
                 continue
             if e.is_directory and names_match(e.name, target_name):
-                found.append(e)
+                if _confirmed_directory_cluster(vol, e.cluster):
+                    found.append(e)
+                elif telemetry_cb:
+                    telemetry_cb(
+                        candidates=1,
+                        operation=(
+                            f"Kandydat uszkodzonego celu {e.name!r}: "
+                            f"klaster {e.cluster} nie jest spójnym katalogiem"
+                        ),
+                    )
             if e.is_directory and not e.is_deleted:
-                walk(e.cluster, depth + 1)
+                if _confirmed_directory_cluster(vol, e.cluster):
+                    walk(e.cluster, depth + 1)
 
     walk(vol.bpb.root_cluster)
     if progress_cb:
@@ -149,7 +181,11 @@ def find_named_directories(
             data = vol.read_cluster(c)
         except Exception:
             continue
-        if not looks_like_directory_cluster(data):
+        if not looks_like_directory_cluster(
+            data,
+            cluster=c,
+            max_cluster=vol.total_clusters + 1,
+        ):
             continue
         self_cluster = int.from_bytes(data[26:28], "little") | (
             int.from_bytes(data[20:22], "little") << 16
@@ -161,11 +197,21 @@ def find_named_directories(
             and self_cluster == c
         ):
             orphan_candidates.append(c)
-        ents = parse_entries_from_buffer(data, vol.cluster_offset(c), parent_cluster=c)
+            if telemetry_cb:
+                telemetry_cb(candidates=1, operation=f"Kandydat katalogu: klaster {c}")
+        ents = parse_entries_from_buffer(
+            data,
+            vol.cluster_offset(c),
+            parent_cluster=c,
+            max_cluster=vol.total_clusters + 1,
+        )
         for e in ents:
             if e.is_directory and names_match(e.name, target_name) and e.cluster >= 2:
                 # Unikaj duplikatów po klastrze
-                if not any(f.cluster == e.cluster for f in found):
+                if (
+                    _confirmed_directory_cluster(vol, e.cluster)
+                    and not any(f.cluster == e.cluster for f in found)
+                ):
                     found.append(e)
                     visited.add(e.cluster)
     return found
@@ -280,15 +326,18 @@ def find_orphan_directories(
             data = vol.read_cluster(c)
         except Exception:
             continue
-        if len(data) < 64:
+        if not looks_like_directory_cluster(
+            data,
+            cluster=c,
+            max_cluster=vol.total_clusters + 1,
+        ):
             continue
-        # Typowy katalog: pierwszy wpis "." wskazujący na siebie
-        if data[0:1] != b"." or data[11] != 0x10:
+        chain = vol.follow_chain(c)
+        if not chain or chain[0] != c:
             continue
-        self_cl = int.from_bytes(data[26:28], "little") | (
-            int.from_bytes(data[20:22], "little") << 16
-        )
-        if self_cl != c:
+        if vol.bpb.num_fats >= 2 and (
+            vol.fat_entry_copy(0, c) != vol.fat_entry_copy(1, c)
+        ):
             continue
         ents = scan_cluster_as_directory(vol, c)
         # Nazwa z kontekstu rodzica niedostępna — użyj klastra
@@ -301,8 +350,13 @@ def find_orphan_directories(
             is_directory=True,
             is_deleted=False,
             confidence=Confidence.LOW,
-            evidence=["wykryty lokalnie po wpisie „.”", "brak dowodu przynależności do katalogu docelowego"],
+            evidence=[
+                "kandydat wykryty po spójnych wpisach „.” i „..”",
+                f"łańcuch FAT: {len(chain)} klastrów",
+                "brak dowodu przynależności do katalogu docelowego",
+            ],
             belongs_to_target=False,
+            is_candidate=True,
             children=build_tree_from_directory(
                 vol, c, name, belongs_to_target=False, visited=set(known_clusters)
             ),

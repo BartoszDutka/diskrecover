@@ -23,6 +23,12 @@ class ScanSnapshot:
     bytes_read: int = 0
     bytes_total: int = 0
     directory_entries: int = 0
+    records_checked: int = 0
+    records_rejected: int = 0
+    valid_entries: int = 0
+    candidates: int = 0
+    confirmed_directories: int = 0
+    confirmed_files: int = 0
     directories_found: int = 0
     files_found: int = 0
     corruptions: int = 0

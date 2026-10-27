@@ -175,6 +175,12 @@ class RecoveryEngine:
                 additive = (
                     "bytes_read",
                     "directory_entries",
+                    "records_checked",
+                    "records_rejected",
+                    "valid_entries",
+                    "candidates",
+                    "confirmed_directories",
+                    "confirmed_files",
                     "directories_found",
                     "files_found",
                     "corruptions",

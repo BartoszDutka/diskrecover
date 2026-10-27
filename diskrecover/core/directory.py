@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import IntFlag
-from typing import Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from diskrecover.core.fat32 import Fat32Volume
 
@@ -43,10 +43,38 @@ class DirEntry:
     access_date: int = 0
     lfn_parts: List[str] = field(default_factory=list)
     parent_cluster: Optional[int] = None
+    classification: str = "confirmed"
 
     @property
     def is_dot(self) -> bool:
         return self.short_name in (".", "..") or self.name in (".", "..")
+
+
+@dataclass
+class DirectoryParseStats:
+    checked_records: int = 0
+    rejected_records: int = 0
+    valid_entries: int = 0
+    lfn_entries: int = 0
+    deleted_entries: int = 0
+    volume_labels: int = 0
+    empty_records: int = 0
+    rejection_examples: List[str] = field(default_factory=list)
+    accepted_examples: List[str] = field(default_factory=list)
+
+    def reject(self, offset: int, reason: str) -> None:
+        self.rejected_records += 1
+        if len(self.rejection_examples) < 10:
+            self.rejection_examples.append(f"0x{offset:X}: {reason}")
+
+    def accept(self, entry: DirEntry) -> None:
+        self.valid_entries += 1
+        if len(self.accepted_examples) < 10:
+            self.accepted_examples.append(
+                f"0x{entry.raw_offset:X}: {entry.name!r} "
+                f"cluster={entry.cluster} "
+                f"{'DIR' if entry.is_directory else 'FILE'}"
+            )
 
 
 def _decode_lfn_chunk(data: bytes) -> str:
@@ -77,62 +105,116 @@ def _parse_sfn(name_bytes: bytes) -> str:
     return base
 
 
+def _entry_cluster(ent: bytes) -> int:
+    return int.from_bytes(ent[26:28], "little") | (
+        int.from_bytes(ent[20:22], "little") << 16
+    )
+
+
+def _sfn_checksum(name_bytes: bytes) -> int:
+    checksum = 0
+    for value in name_bytes[:11]:
+        checksum = ((checksum & 1) << 7) + (checksum >> 1) + value
+        checksum &= 0xFF
+    return checksum
+
+
 def parse_entries_from_buffer(
     buf: bytes,
     base_offset: int,
     parent_cluster: Optional[int] = None,
+    max_cluster: Optional[int] = None,
+    stats: Optional[DirectoryParseStats] = None,
+    diagnostic_cb: Optional[Callable[[str], None]] = None,
 ) -> List[DirEntry]:
     """Parsuj 32-bajtowe wpisy z bufora klastra/katalogu."""
     entries: List[DirEntry] = []
-    pending_lfn: List[Tuple[int, str]] = []
+    pending_lfn: List[Tuple[int, str, int, bool]] = []
 
     for i in range(0, len(buf) - 31, 32):
         ent = buf[i : i + 32]
         first = ent[0]
         if first == END_MARKER:
+            if stats:
+                stats.empty_records += 1
             break
+        if stats:
+            stats.checked_records += 1
         attr = ent[11]
         off = base_offset + i
 
         if attr == Attr.LFN and first != DELETED_MARKER:
             seq = first & 0x1F
+            is_last = bool(first & 0x40)
+            if seq == 0 or seq > 20:
+                if stats:
+                    stats.reject(off, "nieprawidłowa sekwencja LFN")
+                pending_lfn.clear()
+                continue
             chunk = _decode_lfn_chunk(ent)
-            pending_lfn.append((seq, chunk))
+            pending_lfn.append((seq, chunk, ent[13], is_last))
+            if stats:
+                stats.lfn_entries += 1
             continue
 
         if first == DELETED_MARKER and attr == Attr.LFN:
+            if stats:
+                stats.reject(off, "usunięty rekord ma atrybut LFN")
+            pending_lfn.clear()
+            continue
+
+        valid_attr = attr != 0 and attr != Attr.LFN and (attr & ~0x3F) == 0
+        if not valid_attr:
+            if stats:
+                stats.reject(off, f"nieprawidłowe atrybuty 0x{attr:02X}")
+            pending_lfn.clear()
+            continue
+
+        cluster = _entry_cluster(ent)
+        is_deleted = first == DELETED_MARKER
+        is_dir = bool(attr & Attr.DIRECTORY) and not bool(attr & Attr.VOLUME_ID)
+        is_vol = bool(attr & Attr.VOLUME_ID) and not is_dir
+        if is_vol and attr != Attr.VOLUME_ID:
+            if stats:
+                stats.reject(off, "etykieta woluminu ma dodatkowe atrybuty")
+            pending_lfn.clear()
+            continue
+        if max_cluster is not None and cluster > max_cluster:
+            if stats:
+                stats.reject(off, f"klaster {cluster} poza zakresem 2..{max_cluster}")
+            pending_lfn.clear()
+            continue
+        size = int.from_bytes(ent[28:32], "little")
+        if is_dir and cluster < 2:
+            if stats:
+                stats.reject(off, "katalog ma nieprawidłowy klaster początkowy")
+            pending_lfn.clear()
+            continue
+        if not is_dir and not is_vol and cluster < 2 and size != 0:
+            if stats:
+                stats.reject(off, "plik niepusty ma klaster 0/1")
             pending_lfn.clear()
             continue
 
         if first == 0x2E and ent[1] in (0x20, 0x2E):
             # . lub ..
             short = _parse_sfn(ent[0:11])
-            cluster = int.from_bytes(ent[26:28], "little") | (
-                int.from_bytes(ent[20:22], "little") << 16
+            entry = DirEntry(
+                name=short,
+                short_name=short,
+                attributes=attr,
+                cluster=cluster,
+                size=0,
+                is_deleted=False,
+                is_directory=True,
+                is_volume_label=False,
+                is_lfn=False,
+                raw_offset=off,
+                parent_cluster=parent_cluster,
             )
-            entries.append(
-                DirEntry(
-                    name=short,
-                    short_name=short,
-                    attributes=attr,
-                    cluster=cluster,
-                    size=0,
-                    is_deleted=False,
-                    is_directory=bool(attr & Attr.DIRECTORY),
-                    is_volume_label=False,
-                    is_lfn=False,
-                    raw_offset=off,
-                    parent_cluster=parent_cluster,
-                )
-            )
-            pending_lfn.clear()
-            continue
-
-        is_deleted = first == DELETED_MARKER
-        is_vol = bool(attr & Attr.VOLUME_ID) and not bool(attr & Attr.DIRECTORY)
-        is_dir = bool(attr & Attr.DIRECTORY) and not is_vol
-        # Pomiń całkowicie puste / nieprawidłowe
-        if attr == 0 and ent[0:11] == b"\x00" * 11:
+            entries.append(entry)
+            if stats:
+                stats.accept(entry)
             pending_lfn.clear()
             continue
 
@@ -140,21 +222,26 @@ def parse_entries_from_buffer(
         long_name = ""
         if pending_lfn:
             parts = sorted(pending_lfn, key=lambda x: x[0])
-            long_name = "".join(p[1] for p in parts)
+            expected = list(range(1, len(parts) + 1))
+            valid_sequence = [p[0] for p in parts] == expected
+            valid_last = sum(1 for p in pending_lfn if p[3]) == 1
+            long_name = "".join(p[1] for p in parts) if valid_sequence and valid_last else ""
             pending_lfn.clear()
+            if long_name and ent[0:11] != b"\x00" * 11:
+                checksums = {p[2] for p in parts}
+                if len(checksums) != 1 or next(iter(checksums)) != _sfn_checksum(ent[0:11]):
+                    long_name = ""
+                    if diagnostic_cb:
+                        diagnostic_cb(
+                            f"0x{off:X}: odrzucono LFN — zła suma kontrolna"
+                        )
 
         name = long_name if long_name else short
         if is_deleted and long_name:
             # Usunięte LFN mogą być niekompletne — użyj co mamy
             name = long_name
 
-        cluster = int.from_bytes(ent[26:28], "little") | (
-            int.from_bytes(ent[20:22], "little") << 16
-        )
-        size = int.from_bytes(ent[28:32], "little")
-
-        entries.append(
-            DirEntry(
+        entry = DirEntry(
                 name=name or short,
                 short_name=short,
                 attributes=attr,
@@ -173,7 +260,13 @@ def parse_entries_from_buffer(
                 parent_cluster=parent_cluster,
                 lfn_parts=[long_name] if long_name else [],
             )
-        )
+        entries.append(entry)
+        if stats:
+            if is_deleted:
+                stats.deleted_entries += 1
+            if is_vol:
+                stats.volume_labels += 1
+            stats.accept(entry)
     return entries
 
 
@@ -184,6 +277,7 @@ def read_directory(
     include_deleted: bool = True,
     max_clusters: int = 4096,
     visited_clusters: Optional[set[int]] = None,
+    stats: Optional[DirectoryParseStats] = None,
 ) -> List[DirEntry]:
     chain = vol.follow_chain(start_cluster, max_clusters=max_clusters)
     if not chain and start_cluster >= 2:
@@ -194,9 +288,28 @@ def read_directory(
     entries: List[DirEntry] = []
     for c in chain:
         data = vol.read_cluster(c)
+        cluster_stats = DirectoryParseStats()
         ents = parse_entries_from_buffer(
-            data, vol.cluster_offset(c), parent_cluster=start_cluster
+            data,
+            vol.cluster_offset(c),
+            parent_cluster=start_cluster,
+            max_cluster=vol.total_clusters + 1,
+            stats=cluster_stats,
         )
+        if stats:
+            stats.checked_records += cluster_stats.checked_records
+            stats.rejected_records += cluster_stats.rejected_records
+            stats.valid_entries += cluster_stats.valid_entries
+            stats.lfn_entries += cluster_stats.lfn_entries
+            stats.deleted_entries += cluster_stats.deleted_entries
+            stats.volume_labels += cluster_stats.volume_labels
+            stats.empty_records += cluster_stats.empty_records
+            stats.rejection_examples.extend(
+                cluster_stats.rejection_examples[:10 - len(stats.rejection_examples)]
+            )
+            stats.accepted_examples.extend(
+                cluster_stats.accepted_examples[:10 - len(stats.accepted_examples)]
+            )
         for e in ents:
             if not include_deleted and e.is_deleted:
                 continue
@@ -211,6 +324,27 @@ def read_directory(
                     entry_offset=e.raw_offset,
                 )
         if vol.activity_cb:
+            if vol.activity_cb:
+                vol.activity_cb(
+                    records_checked=cluster_stats.checked_records,
+                    records_rejected=cluster_stats.rejected_records,
+                    valid_entries=cluster_stats.valid_entries,
+                    confirmed_directories=sum(
+                        1 for e in ents if e.is_directory
+                    ),
+                    confirmed_files=sum(
+                        1
+                        for e in ents
+                        if not e.is_directory and not e.is_volume_label
+                    ),
+                    operation=(
+                        f"Odczyt katalogu klastra {c}: "
+                        f"zaakceptowano={cluster_stats.valid_entries}, "
+                        f"odrzucono={cluster_stats.rejected_records}; "
+                        f"przykład OK={cluster_stats.accepted_examples[:1]}, "
+                        f"przykład odrzucony={cluster_stats.rejection_examples[:1]}"
+                    ),
+                )
             vol.activity_cb(
                 operation=f"Odczyt katalogu klastra {c}",
             )
@@ -237,32 +371,41 @@ def scan_cluster_as_directory(
     """Traktuj pojedynczy klaster jako potencjalny katalog (rekonstrukcja)."""
     data = vol.read_cluster(cluster)
     return parse_entries_from_buffer(
-        data, vol.cluster_offset(cluster), parent_cluster=cluster
+        data,
+        vol.cluster_offset(cluster),
+        parent_cluster=cluster,
+        max_cluster=vol.total_clusters + 1,
     )
 
 
-def looks_like_directory_cluster(data: bytes) -> bool:
-    """Heurystyka: klaster wygląda na katalog FAT."""
+def looks_like_directory_cluster(
+    data: bytes,
+    *,
+    cluster: Optional[int] = None,
+    max_cluster: Optional[int] = None,
+) -> bool:
+    """Return true only for a structurally plausible FAT directory cluster."""
     if len(data) < 64:
         return False
-    # Często zaczyna się od . i ..
-    if data[0:1] == b"." and data[11] == Attr.DIRECTORY:
-        return True
-    # Albo zawiera sensowne wpisy SFN
-    valid = 0
-    for i in range(0, min(len(data), 512) - 31, 32):
-        ent = data[i : i + 32]
-        if ent[0] == END_MARKER:
-            break
-        attr = ent[11]
-        if attr == Attr.LFN:
-            valid += 1
-            continue
-        if attr & 0x3F and not (attr & ~0x3F & 0xC0):
-            # Rozsądne atrybuty
-            cluster = int.from_bytes(ent[26:28], "little") | (
-                int.from_bytes(ent[20:22], "little") << 16
-            )
-            if cluster < 0x0FFFFFF0:
-                valid += 1
-    return valid >= 2
+    dot = data[:32]
+    dotdot = data[32:64]
+    if (
+        dot[0:1] != b"."
+        or dot[1] != 0x20
+        or dot[11] != Attr.DIRECTORY
+        or dotdot[0:2] != b".."
+        or dotdot[11] != Attr.DIRECTORY
+    ):
+        return False
+    self_cluster = _entry_cluster(dot)
+    parent_cluster = _entry_cluster(dotdot)
+    if cluster is not None and self_cluster != cluster:
+        return False
+    if self_cluster < 2 or (
+        max_cluster is not None and self_cluster > max_cluster
+    ):
+        return False
+    return parent_cluster == 0 or (
+        parent_cluster >= 2
+        and (max_cluster is None or parent_cluster <= max_cluster)
+    )
