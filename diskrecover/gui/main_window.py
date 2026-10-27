@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import time
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -26,6 +32,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from diskrecover.core.checkpoint import default_checkpoint_dir
+from diskrecover.core.recovery import available_checkpoints
 from diskrecover.gui.theme import DARK_QSS
 from diskrecover.gui.workers import AnalyzeWorker, RecoverWorker
 
@@ -33,11 +41,51 @@ DEFAULT_IMAGE = r"C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive_bhp.bin"
 DEFAULT_TARGET = "bhp szkoły"
 
 
+class CheckpointPickerDialog(QDialog):
+    def __init__(self, checkpoints: list[dict], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Wznów poprzednie skanowanie")
+        self.resize(640, 360)
+        self.selected_path: str | None = None
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Wybierz zgodny checkpoint:"))
+        self.list = QListWidget()
+        for ck in checkpoints:
+            meta = ck.get("meta") or {}
+            ts = datetime.fromtimestamp(ck["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
+            size_mb = ck["size"] / (1024 * 1024)
+            stage = meta.get("stage", "?")
+            status = meta.get("status", "?")
+            valid = "OK" if ck.get("valid") else "BŁĄD: " + "; ".join(ck.get("errors") or [])
+            text = (
+                f"{ts} | {size_mb:.2f} MB | etap={stage} | status={status} | {valid}\n"
+                f"{ck['path']}"
+            )
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, ck["path"])
+            if not ck.get("valid"):
+                item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            self.list.addItem(item)
+        layout.addWidget(self.list)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept(self) -> None:
+        item = self.list.currentItem()
+        if not item:
+            QMessageBox.warning(self, "DiskRecover", "Wybierz checkpoint.")
+            return
+        self.selected_path = item.data(Qt.UserRole)
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, initial_image: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("DiskRecover — odzyskiwanie FAT32")
-        self.resize(1100, 720)
+        self.resize(1100, 760)
         self.setStyleSheet(DARK_QSS)
 
         self._analyze_worker: AnalyzeWorker | None = None
@@ -45,6 +93,8 @@ class MainWindow(QMainWindow):
         self._session = None
         self._last_snapshot = None
         self._scan_started_at = 0.0
+        self._resume_checkpoint: str | None = None
+        self._last_ckpt_label = "—"
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -52,7 +102,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        # Brand
         brand = QLabel("DiskRecover")
         brand.setObjectName("Brand")
         sub = QLabel("Bezpieczne odzyskiwanie danych z obrazów FAT32 • tryb tylko do odczytu")
@@ -68,7 +117,6 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_results_tab(), "3. Wyniki")
         tabs.addTab(self._build_about_tab(), "Informacje")
 
-        # Status
         self.status = QLabel("Gotowy. Obraz nie jest modyfikowany.")
         layout.addWidget(self.status)
 
@@ -77,7 +125,8 @@ class MainWindow(QMainWindow):
         else:
             self.image_edit.setText(DEFAULT_IMAGE)
 
-    # ---- tabs ----
+        self._refresh_resume_availability()
+
     def _build_source_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
@@ -93,6 +142,7 @@ class MainWindow(QMainWindow):
         form.addRow("Ścieżka:", row)
 
         self.out_edit = QLineEdit(str(Path.home() / "DiskRecover_output"))
+        self.out_edit.textChanged.connect(lambda _=None: self._refresh_resume_availability())
         out_row = QHBoxLayout()
         out_browse = QPushButton("Przeglądaj…")
         out_browse.clicked.connect(self._browse_output)
@@ -108,6 +158,13 @@ class MainWindow(QMainWindow):
         self.lba_spin.setSpecialValueText("auto (z MBR/BPB)")
         self.lba_spin.setValue(0)
         form.addRow("LBA start partycji:", self.lba_spin)
+
+        self.ckpt_interval = QSpinBox()
+        self.ckpt_interval.setRange(60, 3600)
+        self.ckpt_interval.setValue(300)
+        self.ckpt_interval.setSuffix(" s")
+        form.addRow("Auto-checkpoint co:", self.ckpt_interval)
+
         hint = QLabel(
             "Parametry BPB (sektor, klaster, FAT) są zawsze odczytywane z obrazu. "
             "Pole LBA nadpisuje tylko lokalizację partycji, jeśli MBR jest uszkodzony."
@@ -153,7 +210,7 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(w)
         info = QLabel(
             "Skanowanie jest nieniszczące: obraz otwierany jest wyłącznie w trybie odczytu (rb/mmap). "
-            "Możesz anulować w trakcie — częściowe wyniki i checkpoint zapiszą się w Raport/."
+            "Checkpointy SQLite pozwalają wstrzymać i wznowić bez powtarzania ukończonych etapów."
         )
         info.setWordWrap(True)
         v.addWidget(info)
@@ -161,7 +218,9 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setFormat("Postęp całkowity: %p%")
         v.addWidget(self.progress)
+
         self.stage_progress = QProgressBar()
         self.stage_progress.setRange(0, 100)
         self.stage_progress.setFormat("Postęp bieżącego etapu")
@@ -175,6 +234,10 @@ class MainWindow(QMainWindow):
         self.scan_stats.setWordWrap(True)
         v.addWidget(self.scan_stats)
 
+        self.ckpt_info = QLabel("Ostatni checkpoint: —")
+        self.ckpt_info.setObjectName("Subtitle")
+        v.addWidget(self.ckpt_info)
+
         self.scan_status = QLabel("Oczekiwanie…")
         v.addWidget(self.scan_status)
 
@@ -186,16 +249,50 @@ class MainWindow(QMainWindow):
         self.btn_start = QPushButton("Start odzyskiwania")
         self.btn_start.setObjectName("Primary")
         self.btn_start.clicked.connect(self._start_recover)
+
+        self.btn_resume_prev = QPushButton("Wznów poprzednie skanowanie")
+        self.btn_resume_prev.clicked.connect(self._resume_previous)
+        self.btn_resume_prev.setEnabled(False)
+
+        self.btn_save = QPushButton("Zapisz postęp")
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self._save_progress)
+
+        self.btn_pause = QPushButton("Wstrzymaj")
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.clicked.connect(self._pause_recover)
+
+        self.btn_resume = QPushButton("Wznów")
+        self.btn_resume.setEnabled(False)
+        self.btn_resume.clicked.connect(self._resume_recover)
+
+        self.btn_cancel_save = QPushButton("Anuluj i zapisz")
+        self.btn_cancel_save.setObjectName("Danger")
+        self.btn_cancel_save.setEnabled(False)
+        self.btn_cancel_save.clicked.connect(self._cancel_and_save)
+
         self.btn_cancel = QPushButton("Anuluj")
-        self.btn_cancel.setObjectName("Danger")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self._cancel_recover)
-        row.addWidget(self.btn_start)
-        row.addWidget(self.btn_cancel)
+
+        self.btn_open_ckpt = QPushButton("Otwórz folder checkpointów")
+        self.btn_open_ckpt.clicked.connect(self._open_checkpoints)
+
         self.btn_open_log = QPushButton("Otwórz log diagnostyczny")
         self.btn_open_log.clicked.connect(self._open_log)
-        row.addWidget(self.btn_open_log)
-        row.addStretch()
+
+        for b in (
+            self.btn_start,
+            self.btn_resume_prev,
+            self.btn_save,
+            self.btn_pause,
+            self.btn_resume,
+            self.btn_cancel_save,
+            self.btn_cancel,
+            self.btn_open_ckpt,
+            self.btn_open_log,
+        ):
+            row.addWidget(b)
         v.addLayout(row)
         return w
 
@@ -238,19 +335,17 @@ class MainWindow(QMainWindow):
               <li>Całkowicie nieniszcząca — obraz nigdy nie jest zapisywany</li>
               <li>Parametry FAT (BPB) walidowane z obrazu, nie z notatek</li>
               <li>Rekonstrukcja katalogów, poziomy pewności, carving RAW</li>
+              <li>Checkpointy SQLite: pauza / wznowienie / auto-zapis</li>
               <li>Układ wyjścia: Odtworzony_bhp_szkoly/, Osierocone_katalogi/,
                   RAW/, Nieustalone_pochodzenie/, Raport/</li>
             </ul>
             <p><b>Nieobsługiwane:</b> zapis na oryginalny nośnik, naprawa tablic FAT in-place,
             systemy plików inne niż FAT32, montowanie obrazu.</p>
-            <p>Domyślna ścieżka obrazu (przykład):
-            <code>C:\\Users\\bdutka\\Desktop\\Odzyskiwanie_BHP\\pendrive_bhp.bin</code></p>
             """
         )
         v.addWidget(t)
         return w
 
-    # ---- actions ----
     def _browse_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -269,6 +364,14 @@ class MainWindow(QMainWindow):
     def _partition_lba(self) -> int | None:
         v = self.lba_spin.value()
         return None if v == 0 else v
+
+    def _refresh_resume_availability(self) -> None:
+        out = self.out_edit.text().strip()
+        if not out:
+            self.btn_resume_prev.setEnabled(False)
+            return
+        ckpts = available_checkpoints(out)
+        self.btn_resume_prev.setEnabled(any(c.get("valid") for c in ckpts))
 
     def _start_analyze(self) -> None:
         image = self.image_edit.text().strip()
@@ -301,11 +404,6 @@ class MainWindow(QMainWindow):
             else:
                 lines.append(f"{k}: {v}")
         self.analyze_log.append("\n".join(lines))
-        # Ustaw spin jeśli znaleziono offset
-        off = summary.get("partition_offset", 0)
-        if off and self.lba_spin.value() == 0:
-            # Nie nadpisuj auto — tylko pokaż w logu
-            pass
 
     def _on_analyze_fail(self, err: str) -> None:
         self.btn_analyze.setEnabled(True)
@@ -313,15 +411,29 @@ class MainWindow(QMainWindow):
         self.analyze_log.append(f"BŁĄD: {err}")
         QMessageBox.critical(self, "DiskRecover", f"Analiza nieudana:\n{err}")
 
-    def _start_recover(self) -> None:
+    def _set_scan_controls(self, running: bool, paused: bool = False) -> None:
+        self.btn_start.setEnabled(not running)
+        self.btn_resume_prev.setEnabled(not running and self.btn_resume_prev.isEnabled())
+        if not running:
+            self._refresh_resume_availability()
+        self.btn_save.setEnabled(running)
+        self.btn_pause.setEnabled(running and not paused)
+        self.btn_resume.setEnabled(running and paused)
+        self.btn_cancel.setEnabled(running)
+        self.btn_cancel_save.setEnabled(running)
+
+    def _start_recover(self, *, resume_checkpoint: str | None = None) -> None:
         image = self.image_edit.text().strip()
         out = self.out_edit.text().strip()
         if not image or not out:
             QMessageBox.warning(self, "DiskRecover", "Podaj obraz i katalog wyjściowy.")
             return
-        self.btn_start.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
+        self._resume_checkpoint = resume_checkpoint
+        self._set_scan_controls(True, paused=False)
+        self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.stage_progress.setRange(0, 100)
+        self.stage_progress.setValue(0)
         self.scan_log.clear()
         self.status.setText("Odzyskiwanie w toku…")
         self._recover_worker = RecoverWorker(
@@ -331,22 +443,68 @@ class MainWindow(QMainWindow):
             self._partition_lba(),
             self.chk_raw.isChecked(),
             self.chk_deep.isChecked(),
+            resume_checkpoint=resume_checkpoint,
+            checkpoint_interval_sec=float(self.ckpt_interval.value()),
         )
         self._recover_worker.progress.connect(self._on_recover_progress)
         self._recover_worker.telemetry.connect(self._on_telemetry)
+        self._recover_worker.checkpoint_saved.connect(self._on_checkpoint_saved)
         self._recover_worker.finished_ok.connect(self._on_recover_ok)
         self._recover_worker.failed.connect(self._on_recover_fail)
         self._recover_worker.start()
-        self._scan_started_at = __import__("time").monotonic()
+        self._scan_started_at = time.monotonic()
         if not hasattr(self, "_heartbeat_timer"):
             self._heartbeat_timer = QTimer(self)
             self._heartbeat_timer.timeout.connect(self._check_heartbeat)
         self._heartbeat_timer.start(1000)
 
+    def _resume_previous(self) -> None:
+        out = self.out_edit.text().strip()
+        ckpts = [c for c in available_checkpoints(out) if c.get("valid")]
+        if not ckpts:
+            QMessageBox.information(self, "DiskRecover", "Brak zgodnych checkpointów.")
+            return
+        dlg = CheckpointPickerDialog(ckpts, self)
+        if dlg.exec() != QDialog.Accepted or not dlg.selected_path:
+            return
+        self._start_recover(resume_checkpoint=dlg.selected_path)
+
+    def _save_progress(self) -> None:
+        if self._recover_worker:
+            self._recover_worker.save_progress()
+            self.scan_status.setText("Żądanie zapisu checkpointu…")
+
+    def _pause_recover(self) -> None:
+        if self._recover_worker:
+            self._recover_worker.pause()
+            self._set_scan_controls(True, paused=True)
+            self.scanner_indicator.setText("● WSTRZYMANE")
+            self.scanner_indicator.setStyleSheet("color: #f0ad4e; font-weight: bold")
+            self.scan_status.setText("Skanowanie wstrzymane (możesz zapisać postęp).")
+
+    def _resume_recover(self) -> None:
+        if self._recover_worker:
+            self._recover_worker.resume()
+            self._set_scan_controls(True, paused=False)
+            self.scanner_indicator.setText("● SKANOWANIE")
+            self.scanner_indicator.setStyleSheet("color: #7dd3c0; font-weight: bold")
+            self.scan_status.setText("Wznowiono skanowanie…")
+
     def _cancel_recover(self) -> None:
         if self._recover_worker:
             self._recover_worker.cancel()
             self.scan_status.setText("Anulowanie…")
+
+    def _cancel_and_save(self) -> None:
+        if self._recover_worker:
+            self._recover_worker.cancel_and_save()
+            self.scan_status.setText("Anulowanie z zapisem checkpointu…")
+
+    def _on_checkpoint_saved(self, path: str, saved_at: float) -> None:
+        ts = datetime.fromtimestamp(saved_at).strftime("%Y-%m-%d %H:%M:%S")
+        self._last_ckpt_label = f"{ts} → {path}"
+        self.ckpt_info.setText(f"Ostatni checkpoint: {self._last_ckpt_label}")
+        self.scan_log.append(f"CHECKPOINT zapisany: {path} ({ts})")
 
     def _on_recover_progress(self, pct: int, msg: str) -> None:
         if pct < 0:
@@ -356,13 +514,15 @@ class MainWindow(QMainWindow):
                 self.progress.setRange(0, 100)
             self.progress.setValue(pct)
         self.scan_status.setText(msg)
-        self.scan_log.append(f"[{pct}%] {msg}")
+        # ogranicz spam w logu
+        if not hasattr(self, "_last_log_msg") or self._last_log_msg != msg:
+            self.scan_log.append(f"[{pct}%] {msg}")
+            self._last_log_msg = msg
 
     def _on_recover_ok(self, session) -> None:
         if hasattr(self, "_heartbeat_timer"):
             self._heartbeat_timer.stop()
-        self.btn_start.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
+        self._set_scan_controls(False)
         self._session = session
         self.status.setText("Odzyskiwanie zakończone.")
         self._fill_results(session)
@@ -370,14 +530,14 @@ class MainWindow(QMainWindow):
             self,
             "DiskRecover",
             f"Gotowe.\nPliki: {session.stats.get('plikow_lacznie', 0)}\n"
+            f"Podfoldery „bhp szkoły”: {session.stats.get('podfoldery_bhp_szkoly', 0)}\n"
             f"Raport: {session.output_dir}/Raport/",
         )
 
     def _on_recover_fail(self, err: str) -> None:
         if hasattr(self, "_heartbeat_timer"):
             self._heartbeat_timer.stop()
-        self.btn_start.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
+        self._set_scan_controls(False)
         self.status.setText("Błąd / anulowano.")
         self.scan_log.append(f"BŁĄD: {err}")
         QMessageBox.warning(self, "DiskRecover", err)
@@ -387,48 +547,93 @@ class MainWindow(QMainWindow):
         self._update_scan_stats(snapshot)
 
     def _update_scan_stats(self, snapshot) -> None:
-        total = max(snapshot.clusters_total, 1)
-        stage_pct = int(100 * snapshot.clusters_checked / total)
-        self.stage_progress.setValue(min(100, stage_pct))
-        elapsed = max(0.0, __import__("time").monotonic() - snapshot.started_at)
-        age = max(0.0, __import__("time").monotonic() - snapshot.last_activity)
+        # Postęp etapu: kandydaci jeśli znane, inaczej nieokreślony
+        if snapshot.stage_pct is not None:
+            if self.stage_progress.maximum() == 0:
+                self.stage_progress.setRange(0, 100)
+            self.stage_progress.setValue(int(min(100, max(0, snapshot.stage_pct))))
+            if snapshot.candidates_total:
+                self.stage_progress.setFormat(
+                    f"Etap: {snapshot.orphan_candidates_checked or int(snapshot.stage_pct)}% "
+                    f"({snapshot.candidates_total - snapshot.candidates_remaining}/"
+                    f"{snapshot.candidates_total} kandydatów)"
+                )
+            else:
+                self.stage_progress.setFormat(f"Etap: {int(snapshot.stage_pct)}%")
+        elif snapshot.candidates_total > 0:
+            if self.stage_progress.maximum() == 0:
+                self.stage_progress.setRange(0, 100)
+            done = snapshot.candidates_total - snapshot.candidates_remaining
+            pct = int(100 * done / max(snapshot.candidates_total, 1))
+            self.stage_progress.setValue(pct)
+            self.stage_progress.setFormat(
+                f"Kandydaci: {done}/{snapshot.candidates_total}"
+            )
+        else:
+            # Nieznana liczba operacji — pasek nieokreślony, nie fikcyjny %
+            self.stage_progress.setRange(0, 0)
+            self.stage_progress.setFormat("Etap w toku (liczba operacji nieznana)")
+
+        if snapshot.overall_pct is not None:
+            if self.progress.maximum() == 0:
+                self.progress.setRange(0, 100)
+            self.progress.setValue(int(min(100, max(0, snapshot.overall_pct))))
+
+        elapsed = max(0.0, time.monotonic() - snapshot.started_at)
+        age = max(0.0, time.monotonic() - snapshot.last_activity)
         mb = snapshot.bytes_read / (1024 * 1024)
         speed = mb / elapsed if elapsed else 0.0
+        rate = snapshot.analysis_rate
+        sc = snapshot.stage_counters or {}
+
         self.scan_stats.setText(
             f"Etap: {snapshot.stage}\n"
             f"Operacja: {snapshot.operation}\n"
-            f"Przeanalizowane klastry: {snapshot.clusters_checked:,} / "
-            f"{snapshot.clusters_total:,}\n"
+            f"Postęp etapu: kandydaci "
+            f"{snapshot.candidates_total - snapshot.candidates_remaining}/"
+            f"{snapshot.candidates_total or '—'}"
+            f" (pozostało {snapshot.candidates_remaining or '—'})\n"
             f"Aktualny klaster: {snapshot.cluster or '-'} | "
             f"LBA: {snapshot.lba or '-'}\n"
-            f"Przeczytane dane: {mb:,.2f} MB | Prędkość: {speed:,.1f} MB/s\n"
-            f"Wpisy katalogowe: {snapshot.directory_entries:,} | "
-            f"Rekordy sprawdzone: {snapshot.records_checked:,} | "
+            f"Unikalne klastry: {snapshot.unique_clusters_analyzed:,} | "
+            f"Odczyty: {snapshot.cluster_reads:,} | "
+            f"Ponowne odczyty: {snapshot.rereads:,} | "
+            f"Łańcuchy FAT: {snapshot.fat_chains_checked:,}\n"
+            f"Przeczytane dane: {mb:,.2f} MB | Prędkość I/O: {speed:,.1f} MB/s | "
+            f"Tempo analizy: {rate:,.1f}/s\n"
+            f"Kandydaci orphan: {snapshot.orphan_candidates:,} | "
+            f"Sprawdzeni: {snapshot.orphan_candidates_checked:,} | "
+            f"Odrzuceni: {snapshot.orphan_candidates_rejected:,} | "
+            f"Potwierdzeni: {snapshot.orphan_directories_confirmed:,}\n"
+            f"Rekordy FAT32: {snapshot.records_checked:,} | "
             f"Odrzucone: {snapshot.records_rejected:,} | "
-            f"Poprawne: {snapshot.valid_entries:,}\n"
-            f"Kandydaci: {snapshot.candidates:,} | "
+            f"Poprawne wpisy: {snapshot.valid_entries:,}\n"
             f"Potwierdzone katalogi: {snapshot.confirmed_directories:,} | "
             f"Potwierdzone pliki: {snapshot.confirmed_files:,}\n"
-            f"Katalogi: {snapshot.directories_found:,} | "
-            f"Pliki: {snapshot.files_found:,} | "
+            f"Podfoldery powiązane z bhp szkoły: {snapshot.target_linked_subdirs:,} | "
+            f"Pliki w potwierdzonych podfolderach: {snapshot.target_linked_files:,}\n"
+            f"Unikalne obiekty: {snapshot.unique_objects:,} | "
             f"Uszkodzenia: {snapshot.corruptions:,}\n"
-            f"Czas: {elapsed:,.1f} s | Ostatnia aktywność: {age:,.1f} s temu"
+            f"Czas: {elapsed:,.1f} s | Ostatnia aktywność: {age:,.1f} s temu\n"
+            f"Etap (liczniki lokalne): {sc}"
         )
-        self.scanner_indicator.setText("● SKANOWANIE")
-        self.scanner_indicator.setStyleSheet("color: #7dd3c0; font-weight: bold")
+        if snapshot.status == "wstrzymane":
+            self.scanner_indicator.setText("● WSTRZYMANE")
+            self.scanner_indicator.setStyleSheet("color: #f0ad4e; font-weight: bold")
+        else:
+            self.scanner_indicator.setText("● SKANOWANIE")
+            self.scanner_indicator.setStyleSheet("color: #7dd3c0; font-weight: bold")
 
     def _check_heartbeat(self) -> None:
         snapshot = self._last_snapshot
         if snapshot is None:
             return
-        age = __import__("time").monotonic() - snapshot.last_activity
+        if snapshot.status == "wstrzymane":
+            return
+        age = time.monotonic() - snapshot.last_activity
         if age >= 30:
             self.scanner_indicator.setText("● BRAK AKTYWNOŚCI — SPRAWDŹ LOG")
             self.scanner_indicator.setStyleSheet("color: #f0ad4e; font-weight: bold")
-            self.scan_log.append(
-                f"DIAGNOSTYKA: brak heartbeat przez {age:.1f} s; "
-                "proces nie został automatycznie uznany za zawieszony."
-            )
         elif age >= 3:
             self.scanner_indicator.setText("● AKTYWNE, BEZ NOWYCH WYNIKÓW")
             self.scanner_indicator.setStyleSheet("color: #f0ad4e; font-weight: bold")
@@ -440,7 +645,14 @@ class MainWindow(QMainWindow):
         if path.is_file():
             self._open_path(str(path))
         else:
-            QMessageBox.information(self, "DiskRecover", "Log zostanie utworzony po rozpoczęciu skanowania.")
+            QMessageBox.information(
+                self, "DiskRecover", "Log zostanie utworzony po rozpoczęciu skanowania."
+            )
+
+    def _open_checkpoints(self) -> None:
+        path = default_checkpoint_dir(self.out_edit.text().strip())
+        path.mkdir(parents=True, exist_ok=True)
+        self._open_path(str(path))
 
     def _fill_results(self, session) -> None:
         s = session.stats
@@ -450,6 +662,8 @@ class MainWindow(QMainWindow):
             f"Osierocone: {s.get('osierocone',0)} | "
             f"Nieustalone: {s.get('nieustalone',0)} | "
             f"RAW: {s.get('raw',0)} | "
+            f"Podfoldery bhp szkoły: {s.get('podfoldery_bhp_szkoly',0)} | "
+            f"Pliki w podfolderach: {s.get('pliki_w_podfolderach_bhp',0)} | "
             f"Pewność ↑ {s.get('wysokie',0)} / ↔ {s.get('srednie',0)} / ↓ {s.get('niskie',0)}"
         )
         files = [i for i in session.items if not i.is_directory]
@@ -471,7 +685,9 @@ class MainWindow(QMainWindow):
         if path.is_file():
             self._open_path(str(path))
         else:
-            QMessageBox.information(self, "DiskRecover", "Brak raportu — najpierw uruchom odzyskiwanie.")
+            QMessageBox.information(
+                self, "DiskRecover", "Brak raportu — najpierw uruchom odzyskiwanie."
+            )
 
     def _open_path(self, path: str) -> None:
         import os

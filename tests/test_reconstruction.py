@@ -11,6 +11,7 @@ def test_reconstruct_finds_target(fat32_image):
         result = reconstruct_target(vol, "bhp szkoły", deep_scan=True)
         assert result.target_found
         assert result.target_cluster == 3
+        assert result.target_directory_intact
         flat = flatten_nodes(result.nodes)
         files = [n for n in flat if not n.is_directory]
         assert any("notatka" in n.name.lower() for n in files)
@@ -21,6 +22,10 @@ def test_orphans_not_claimed_as_target(fat32_image):
     with ImageReader(fat32_image["path"]) as reader:
         vol = Fat32Volume.open(reader, fat32_image["partition_offset"])
         result = reconstruct_target(vol, "bhp szkoły", deep_scan=False)
-        assert result.orphan_directories
+        assert result.orphan_directories or result.target_linked_orphans
         for o in result.orphan_directories:
             assert o.belongs_to_target is False
+        # Podfoldery z .. → target są osobno i mają belongs_to_target=True
+        for o in result.target_linked_orphans:
+            assert o.belongs_to_target is True
+            assert o.parent_cluster == result.target_cluster

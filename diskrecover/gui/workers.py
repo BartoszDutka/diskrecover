@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QThread, Signal
 import time
+from pathlib import Path
 
-from diskrecover.core.recovery import RecoveryEngine, RecoverySession
+from PySide6.QtCore import QThread, Signal
+
+from diskrecover.core.recovery import RecoveryEngine
 from diskrecover.core.telemetry import log_exception
 
 
@@ -51,14 +53,13 @@ class AnalyzeWorker(QThread):
                 self.progress.emit(100, "Analiza zakończona")
                 self.finished_ok.emit(summary)
         except Exception as e:
-            if self.engine.logger:
-                log_exception(self.engine.logger, "Błąd skanowania")
             self.failed.emit(str(e))
 
 
 class RecoverWorker(QThread):
     progress = Signal(int, str)
     telemetry = Signal(object)
+    checkpoint_saved = Signal(str, float)
     finished_ok = Signal(object)
     failed = Signal(str)
 
@@ -70,6 +71,9 @@ class RecoverWorker(QThread):
         partition_lba: int | None,
         enable_raw: bool,
         deep_scan: bool,
+        *,
+        resume_checkpoint: str | None = None,
+        checkpoint_interval_sec: float = 300.0,
     ) -> None:
         super().__init__()
         self.engine = RecoveryEngine(
@@ -79,12 +83,35 @@ class RecoverWorker(QThread):
             partition_lba=partition_lba,
             enable_raw=enable_raw,
             deep_scan=deep_scan,
+            resume_checkpoint=resume_checkpoint,
+            checkpoint_interval_sec=checkpoint_interval_sec,
         )
         self._last_telemetry_emit = 0.0
         self._last_stage = ""
+        self._cancel_with_save = False
 
     def cancel(self) -> None:
         self.engine.request_cancel()
+
+    def cancel_and_save(self) -> None:
+        self._cancel_with_save = True
+        self.engine.cancel_and_save()
+
+    def pause(self) -> None:
+        self.engine.request_pause()
+
+    def resume(self) -> None:
+        self.engine.request_resume()
+
+    def save_progress(self) -> None:
+        self.engine.request_checkpoint()
+        # jeśli worker stoi na pauzie, zapisz synchronicznie
+        if self.engine.is_paused():
+            try:
+                path = self.engine.save_checkpoint(reason="manual")
+                self.checkpoint_saved.emit(str(path), time.time())
+            except Exception as e:
+                self.failed.emit(f"Zapis checkpointu nieudany: {e}")
 
     def run(self) -> None:
         try:
@@ -93,20 +120,33 @@ class RecoverWorker(QThread):
                 if (
                     now - self._last_telemetry_emit >= 0.5
                     or snapshot.stage != self._last_stage
-                    or snapshot.status in ("zakończone", "błąd")
+                    or snapshot.status in ("zakończone", "błąd", "wstrzymane")
                 ):
                     self._last_telemetry_emit = now
                     self._last_stage = snapshot.stage
                     self.telemetry.emit(snapshot)
 
+            def on_ckpt(path: str, saved_at: float) -> None:
+                self.checkpoint_saved.emit(path, saved_at)
+
             session = self.engine.run(
                 progress_cb=lambda p, m: self.progress.emit(p, m),
                 telemetry_cb=emit_telemetry,
+                checkpoint_cb=on_ckpt,
             )
             self.finished_ok.emit(session)
         except InterruptedError:
-            self.failed.emit("Anulowano przez użytkownika.")
+            msg = "Anulowano przez użytkownika."
+            if self._cancel_with_save:
+                ckpt = self.engine._checkpoint_path()
+                if ckpt.is_file():
+                    msg = f"Anulowano. Checkpoint zapisany: {ckpt}"
+                else:
+                    msg = "Anulowano. Nie udało się potwierdzić zapisu checkpointu."
+            self.failed.emit(msg)
         except Exception as e:
+            if self.engine.logger:
+                log_exception(self.engine.logger, "Błąd skanowania")
             self.failed.emit(str(e))
         finally:
             self.engine.close()

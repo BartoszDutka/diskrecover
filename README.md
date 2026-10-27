@@ -52,8 +52,25 @@ Odtworzony_bhp_szkoly/     — pliki z dowodem przynależności do katalogu doce
 Osierocone_katalogi/       — katalogi wykryte lokalnie, bez linku z drzewa
 RAW/                       — carving po sygnaturach (PDF, Office, obrazy, media…)
 Nieustalone_pochodzenie/   — niepewna przynależność
-Raport/                    — raport.html, raport.json, raport.csv, checkpoint.json
+Raport/                    — raport.html, raport.json, raport.csv, checkpoint.json, profile.txt
+Raport/checkpoints/        — checkpointy SQLite (wznawialny stan skanowania)
 ```
+
+## Checkpointy i wznawianie
+
+Zakładka **Skanowanie** zawiera:
+
+- **Zapisz postęp** — atomowy checkpoint SQLite bez zatrzymywania skanu
+- **Wstrzymaj / Wznów** — bezpieczne zatrzymanie workera
+- **Anuluj i zapisz** — checkpoint, potem przerwanie
+- **Wznów poprzednie skanowanie** — wybór zgodnego checkpointu (weryfikacja odcisku obrazu)
+- **Otwórz folder checkpointów**
+
+Auto-zapis: co N sekund (domyślnie 300), po etapach oraz po N kandydatch osieroconych.
+
+Osierocone podfoldery z wpisem `..` wskazującym klaster katalogu docelowego
+(np. `1843110` dla `bhp szkoły`) są oznaczane osobno i eksportowane do
+`Odtworzony_bhp_szkoly/` z poziomem pewności „wysokie”.
 
 ## Testy
 

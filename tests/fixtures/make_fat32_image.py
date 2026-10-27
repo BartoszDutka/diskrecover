@@ -185,10 +185,12 @@ def build_fat32_image(
     # 5: foto.jpg
     # 6: INNE/
     # 7: inne.txt
-    # 8: orphan dir
+    # 8: orphan dir (parent=root, niepowiązany z celem)
     # 9: orphan file
     # 10: deleted file data (stary)
-    # 11+: raw PDF area (marked free)
+    # 11: orphan child of bhp szkoły ( .. → 3 ), bez wpisu w klastrze 3
+    # 12: plik w orphan child
+    # 13+: raw PDF area (marked free)
 
     fat = [0] * (lay.fat_size_sectors * bps // 4)
     fat[0] = 0x0FFFFFF8
@@ -209,6 +211,9 @@ def build_fat32_image(
     set_chain([9])
     if include_deleted:
         set_chain([10])
+    if include_orphan:
+        set_chain([11])
+        set_chain([12])
 
     # Zapisz FAT x2
     fat_blob = bytearray(fat_bytes)
@@ -284,6 +289,16 @@ def build_fat32_image(
         buf = bytearray(cluster_size)
         buf[: len(orphan_file)] = orphan_file
         img[cluster_off(9) : cluster_off(9) + cluster_size] = buf
+
+        # Osierocony podfolder „bhp szkoły”: .. → 3, bez wpisu w klastrze 3
+        child_payload = b"Dokument z podfolderu bhp szkoly.\n"
+        child_dir = bytearray(cluster_size)
+        child_dir[0:64] = _dot_entries(11, 3)  # parent = target cluster
+        child_dir[64:96] = _dir_entry("BHPCHILD.TXT", 12, len(child_payload))
+        img[cluster_off(11) : cluster_off(11) + cluster_size] = child_dir
+        buf = bytearray(cluster_size)
+        buf[: len(child_payload)] = child_payload
+        img[cluster_off(12) : cluster_off(12) + cluster_size] = buf
 
     if include_deleted:
         buf = bytearray(cluster_size)

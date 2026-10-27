@@ -270,6 +270,20 @@ def parse_entries_from_buffer(
     return entries
 
 
+def parent_cluster_from_dotdot(entries: List[DirEntry]) -> Optional[int]:
+    for e in entries:
+        if e.is_dot and e.short_name == "..":
+            return e.cluster
+    return None
+
+
+def self_cluster_from_dot(entries: List[DirEntry]) -> Optional[int]:
+    for e in entries:
+        if e.is_dot and e.short_name == ".":
+            return e.cluster
+    return None
+
+
 def read_directory(
     vol: Fat32Volume,
     start_cluster: int,
@@ -278,15 +292,40 @@ def read_directory(
     max_clusters: int = 4096,
     visited_clusters: Optional[set[int]] = None,
     stats: Optional[DirectoryParseStats] = None,
+    tracker: object = None,
+    use_cache: bool = True,
+    emit_activity: bool = True,
 ) -> List[DirEntry]:
+    """Odczyt katalogu z opcjonalnym cache trackera (bez ponownego parsowania)."""
+    cached = None
+    if use_cache and tracker is not None:
+        cached = tracker.get_cached(start_cluster)  # type: ignore[attr-defined]
+        if cached is not None:
+            if visited_clusters is not None:
+                visited_clusters.update(cached.chain)
+            if stats is not None:
+                stats.checked_records += cached.stats.checked_records
+                stats.rejected_records += cached.stats.rejected_records
+                stats.valid_entries += cached.stats.valid_entries
+            entries = cached.entries
+            if not include_deleted:
+                entries = [e for e in entries if not e.is_deleted]
+            return [e for e in entries if not e.is_volume_label]
+
+    if tracker is not None:
+        tracker.fat_chains_checked += 1  # type: ignore[attr-defined]
+
     chain = vol.follow_chain(start_cluster, max_clusters=max_clusters)
     if not chain and start_cluster >= 2:
-        # Uszkodzony łańcuch — spróbuj przynajmniej pierwszego klastra
         chain = [start_cluster]
     if visited_clusters is not None:
         visited_clusters.update(chain)
-    entries: List[DirEntry] = []
+
+    all_entries: List[DirEntry] = []
+    aggregate = DirectoryParseStats()
     for c in chain:
+        if tracker is not None:
+            tracker.note_read(c)  # type: ignore[attr-defined]
         data = vol.read_cluster(c)
         cluster_stats = DirectoryParseStats()
         ents = parse_entries_from_buffer(
@@ -296,59 +335,88 @@ def read_directory(
             max_cluster=vol.total_clusters + 1,
             stats=cluster_stats,
         )
-        if stats:
-            stats.checked_records += cluster_stats.checked_records
-            stats.rejected_records += cluster_stats.rejected_records
-            stats.valid_entries += cluster_stats.valid_entries
-            stats.lfn_entries += cluster_stats.lfn_entries
-            stats.deleted_entries += cluster_stats.deleted_entries
-            stats.volume_labels += cluster_stats.volume_labels
-            stats.empty_records += cluster_stats.empty_records
-            stats.rejection_examples.extend(
-                cluster_stats.rejection_examples[:10 - len(stats.rejection_examples)]
+        aggregate.checked_records += cluster_stats.checked_records
+        aggregate.rejected_records += cluster_stats.rejected_records
+        aggregate.valid_entries += cluster_stats.valid_entries
+        aggregate.lfn_entries += cluster_stats.lfn_entries
+        aggregate.deleted_entries += cluster_stats.deleted_entries
+        aggregate.volume_labels += cluster_stats.volume_labels
+        aggregate.empty_records += cluster_stats.empty_records
+        if len(aggregate.rejection_examples) < 10:
+            aggregate.rejection_examples.extend(
+                cluster_stats.rejection_examples[
+                    : 10 - len(aggregate.rejection_examples)
+                ]
             )
-            stats.accepted_examples.extend(
-                cluster_stats.accepted_examples[:10 - len(stats.accepted_examples)]
+        if len(aggregate.accepted_examples) < 10:
+            aggregate.accepted_examples.extend(
+                cluster_stats.accepted_examples[
+                    : 10 - len(aggregate.accepted_examples)
+                ]
             )
         for e in ents:
-            if not include_deleted and e.is_deleted:
-                continue
             if e.is_volume_label:
                 continue
-            entries.append(e)
-            if vol.activity_cb:
+            all_entries.append(e)
+            if not include_deleted and e.is_deleted:
+                continue
+            if emit_activity and vol.activity_cb:
                 vol.activity_cb(
                     directory_entries=1,
                     files_found=0 if e.is_directory else 1,
                     directories_found=1 if e.is_directory else 0,
                     entry_offset=e.raw_offset,
                 )
-        if vol.activity_cb:
-            if vol.activity_cb:
-                vol.activity_cb(
-                    records_checked=cluster_stats.checked_records,
-                    records_rejected=cluster_stats.rejected_records,
-                    valid_entries=cluster_stats.valid_entries,
-                    confirmed_directories=sum(
-                        1 for e in ents if e.is_directory
-                    ),
-                    confirmed_files=sum(
-                        1
-                        for e in ents
-                        if not e.is_directory and not e.is_volume_label
-                    ),
-                    operation=(
-                        f"Odczyt katalogu klastra {c}: "
-                        f"zaakceptowano={cluster_stats.valid_entries}, "
-                        f"odrzucono={cluster_stats.rejected_records}; "
-                        f"przykład OK={cluster_stats.accepted_examples[:1]}, "
-                        f"przykład odrzucony={cluster_stats.rejection_examples[:1]}"
-                    ),
-                )
+        if emit_activity and vol.activity_cb:
             vol.activity_cb(
-                operation=f"Odczyt katalogu klastra {c}",
+                records_checked=cluster_stats.checked_records,
+                records_rejected=cluster_stats.rejected_records,
+                valid_entries=cluster_stats.valid_entries,
+                confirmed_directories=sum(1 for e in ents if e.is_directory),
+                confirmed_files=sum(
+                    1
+                    for e in ents
+                    if not e.is_directory and not e.is_volume_label
+                ),
+                operation=(
+                    f"Odczyt katalogu klastra {c}: "
+                    f"zaakceptowano={cluster_stats.valid_entries}, "
+                    f"odrzucono={cluster_stats.rejected_records}"
+                ),
             )
-    return entries
+
+    if stats is not None:
+        stats.checked_records += aggregate.checked_records
+        stats.rejected_records += aggregate.rejected_records
+        stats.valid_entries += aggregate.valid_entries
+        stats.lfn_entries += aggregate.lfn_entries
+        stats.deleted_entries += aggregate.deleted_entries
+        stats.volume_labels += aggregate.volume_labels
+        stats.empty_records += aggregate.empty_records
+        stats.rejection_examples.extend(
+            aggregate.rejection_examples[: 10 - len(stats.rejection_examples)]
+        )
+        stats.accepted_examples.extend(
+            aggregate.accepted_examples[: 10 - len(stats.accepted_examples)]
+        )
+
+    if tracker is not None and use_cache:
+        from diskrecover.core.cluster_tracker import DirectoryCacheEntry
+
+        tracker.put_cache(  # type: ignore[attr-defined]
+            DirectoryCacheEntry(
+                start_cluster=start_cluster,
+                chain=tuple(chain),
+                entries=list(all_entries),
+                stats=aggregate,
+                parent_from_dotdot=parent_cluster_from_dotdot(all_entries),
+                self_from_dot=self_cluster_from_dot(all_entries),
+            )
+        )
+
+    if include_deleted:
+        return all_entries
+    return [e for e in all_entries if not e.is_deleted]
 
 
 def normalize_name(name: str) -> str:
@@ -366,10 +434,17 @@ def name_contains(haystack: str, needle: str) -> bool:
 
 
 def scan_cluster_as_directory(
-    vol: Fat32Volume, cluster: int
+    vol: Fat32Volume,
+    cluster: int,
+    *,
+    data: Optional[bytes] = None,
+    tracker: object = None,
 ) -> List[DirEntry]:
     """Traktuj pojedynczy klaster jako potencjalny katalog (rekonstrukcja)."""
-    data = vol.read_cluster(cluster)
+    if data is None:
+        if tracker is not None:
+            tracker.note_read(cluster)  # type: ignore[attr-defined]
+        data = vol.read_cluster(cluster)
     return parse_entries_from_buffer(
         data,
         vol.cluster_offset(cluster),
