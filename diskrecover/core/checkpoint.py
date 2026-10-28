@@ -72,6 +72,7 @@ class CheckpointMeta:
     output_dir: str = ""
     deep_scan: bool = True
     enable_raw: bool = True
+    recovery_mode: str = "FULL_RECOVERY"
     partition_lba: Optional[int] = None
     image: Optional[ImageFingerprint] = None
     volume_summary: Dict[str, Any] = field(default_factory=dict)
@@ -196,6 +197,7 @@ class CheckpointStore:
                 output_dir=raw.get("output_dir") or "",
                 deep_scan=bool(raw.get("deep_scan", True)),
                 enable_raw=bool(raw.get("enable_raw", True)),
+                recovery_mode=str(raw.get("recovery_mode") or "FULL_RECOVERY"),
                 partition_lba=raw.get("partition_lba"),
                 image=image,
                 volume_summary=raw.get("volume_summary") or {},

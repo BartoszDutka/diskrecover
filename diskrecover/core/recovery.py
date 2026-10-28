@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -53,6 +54,11 @@ OUTPUT_DIRS = (
     "Nieustalone_pochodzenie",
     "Raport",
 )
+
+
+class RecoveryMode(str, Enum):
+    TARGET_ONLY = "TARGET_ONLY"
+    FULL_RECOVERY = "FULL_RECOVERY"
 
 
 def safe_filename(name: str) -> str:
@@ -181,6 +187,8 @@ class RecoveryEngine:
         candidate_max_clusters: int = 50_000,
         candidate_max_records: int = 250_000,
         retry_deferred: bool = False,
+        mode: RecoveryMode | str = RecoveryMode.FULL_RECOVERY,
+        target_cluster: Optional[int] = None,
     ) -> None:
         self.image_path = Path(image_path)
         self.output_dir = Path(output_dir)
@@ -196,6 +204,14 @@ class RecoveryEngine:
         self.candidate_max_clusters = candidate_max_clusters
         self.candidate_max_records = candidate_max_records
         self.retry_deferred = retry_deferred
+        self.target_cluster = target_cluster
+        try:
+            self.mode = RecoveryMode(mode)
+        except ValueError as exc:
+            raise ValueError(
+                f"Nieznany tryb odzyskiwania: {mode!r}; "
+                f"oczekiwano TARGET_ONLY lub FULL_RECOVERY"
+            ) from exc
 
         self._cancel = False
         self._pause = threading.Event()
@@ -215,11 +231,12 @@ class RecoveryEngine:
         self._scan_state: Dict = {
             "stage": "init",
             "stage_index": 0,
+            "recovery_mode": self.mode.value,
             "completed_stages": [],
             "orphan_candidates": [],
             "already_checked": [],
             "known_clusters": [],
-            "target_cluster": None,
+            "target_cluster": target_cluster,
         }
         self._checkpoint_cb: CheckpointCb = None
         self._latest_recon: Optional[ReconstructionResult] = None
@@ -438,10 +455,11 @@ class RecoveryEngine:
                     output_dir=str(self.output_dir),
                     deep_scan=self.deep_scan,
                     enable_raw=self.enable_raw,
+                    recovery_mode=self.mode.value,
                     partition_lba=self.partition_lba,
                     image=fp,
                     volume_summary=vol_summary,
-                    complete=False,
+                    complete=reason == "completed",
                 )
                 store.save_meta(meta)
                 store.replace_int_set(
@@ -487,6 +505,7 @@ class RecoveryEngine:
                     "partition_lba": self.partition_lba,
                     "checkpoint_interval_sec": self.checkpoint_interval_sec,
                     "checkpoint_every_candidates": self.checkpoint_every_candidates,
+                    "recovery_mode": self.mode.value,
                 })
                 for stage in state.get("completed_stages") or []:
                     store.upsert_task(f"stage:{stage}", "stage", {"name": stage}, "done")
@@ -772,6 +791,11 @@ class RecoveryEngine:
                 raise ValueError(
                     f"Inny katalog docelowy w checkpoincie: {meta.target_name!r}"
                 )
+            checkpoint_mode = meta.recovery_mode or RecoveryMode.FULL_RECOVERY.value
+            if self.mode != RecoveryMode(checkpoint_mode):
+                raise ValueError(
+                    f"Inny tryb odzyskiwania w checkpoincie: {checkpoint_mode}"
+                )
             state = store.load_json_blob("scan_state") or {}
             self._scan_state.update(state)
             self.tracker.import_state(state.get("tracker") or {})
@@ -997,6 +1021,7 @@ class RecoveryEngine:
                 max_records=self.candidate_max_records,
             ),
             retry_deferred=self.retry_deferred,
+            target_cluster_hint=self._scan_state.get("target_cluster"),
         )
         self._flush_result_batch()
         self._latest_recon = recon
@@ -1031,6 +1056,8 @@ class RecoveryEngine:
         self._export_total = max(
             1, len(flatten_nodes(recon.nodes + recon.orphan_directories))
         )
+        if self.mode == RecoveryMode.TARGET_ONLY:
+            self._export_total = max(1, len(flatten_nodes(recon.nodes)))
 
         if progress_cb:
             progress_cb(55, "Rekonstruuję znalezione pliki…")
@@ -1046,25 +1073,31 @@ class RecoveryEngine:
         if progress_cb:
             progress_cb(62, "Eksportuję osierocone katalogi…")
         orphan_root = self.output_dir / "Osierocone_katalogi"
-        for orphan in recon.orphan_directories:
+        if self.mode == RecoveryMode.FULL_RECOVERY:
+            for orphan in recon.orphan_directories:
+                items.extend(
+                    self._export_tree(
+                        vol,
+                        [orphan],
+                        orphan_root,
+                        category="orphan",
+                        known_offsets=known_offsets,
+                        force_unknown_bucket=False,
+                    )
+                )
+        if self.mode == RecoveryMode.FULL_RECOVERY:
+            if progress_cb:
+                progress_cb(66, "Eksportuję pozostałe wpisy z katalogu głównego…")
             items.extend(
-                self._export_tree(
-                    vol,
-                    [orphan],
-                    orphan_root,
-                    category="orphan",
-                    known_offsets=known_offsets,
-                    force_unknown_bucket=False,
+                self._export_other_root_entries(
+                    vol, recon, known_offsets=known_offsets, progress_cb=progress_cb
                 )
             )
-
-        if progress_cb:
-            progress_cb(66, "Eksportuję pozostałe wpisy z katalogu głównego…")
-        items.extend(
-            self._export_other_root_entries(
-                vol, recon, known_offsets=known_offsets, progress_cb=progress_cb
+        elif progress_cb:
+            progress_cb(
+                78,
+                "TARGET_ONLY: pomijam eksport pozostałych wpisów katalogu głównego.",
             )
-        )
         self._flush_result_batch()
 
         if not recon.target_found:
@@ -1078,7 +1111,11 @@ class RecoveryEngine:
             )
 
         carved: List[CarvedFile] = []
-        if self.enable_raw and "raw" not in (self._scan_state.get("completed_stages") or []):
+        if (
+            self.mode == RecoveryMode.FULL_RECOVERY
+            and self.enable_raw
+            and "raw" not in (self._scan_state.get("completed_stages") or [])
+        ):
             if progress_cb:
                 progress_cb(70, "Carving RAW (sygnatury)…")
             self._scan_state["stage"] = "raw"

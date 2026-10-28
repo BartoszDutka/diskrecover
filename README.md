@@ -45,6 +45,35 @@ python -m diskrecover recover "C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive
 
 Opcje: `--no-raw`, `--shallow`, `--partition-lba N`, `--json`.
 
+### CLI — odzyskiwanie wyłącznie `bhp szkoły`
+
+Tryb `TARGET_ONLY` kończy rekonstrukcję po zapisaniu obiektów powiązanych z
+katalogiem docelowym. Nie eksportuje innych wpisów katalogu głównego, osieroconych
+katalogów ani RAW:
+
+```bash
+python -m diskrecover recover "C:\ścieżka\obraz.bin" -o "D:\Odzysk_BHP" \
+  --mode TARGET_ONLY --target "bhp szkoły" --target-cluster 1843110 --no-raw
+```
+
+Tryb pełnego odzyskiwania pozostaje dostępny jawnie:
+
+```bash
+python -m diskrecover recover "C:\ścieżka\obraz.bin" -o "D:\Odzysk_BHP" \
+  --mode FULL_RECOVERY
+```
+
+Jeżeli `Raport/results.sqlite` już zawiera zapisane rekordy `target`, można je
+wyeksportować bez ponownego skanowania i bez modyfikacji obrazu:
+
+```bash
+python -m diskrecover export-target "C:\ścieżka\obraz.bin" \
+  -o "D:\Odzysk_BHP" --target "bhp szkoły"
+```
+
+Polecenie odczytuje wyłącznie istniejącą bazę wyników oraz potrzebne klastry
+obrazu w trybie read-only.
+
 ### Diagnostyka pojedynczego kandydata
 
 Diagnostyka nie uruchamia pełnego skanowania. Wymaga konkretnego numeru

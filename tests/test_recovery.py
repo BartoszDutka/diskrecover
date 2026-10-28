@@ -2,7 +2,8 @@
 
 from pathlib import Path
 
-from diskrecover.core.recovery import RecoveryEngine
+from diskrecover.core.checkpoint import CheckpointStore
+from diskrecover.core.recovery import RecoveryEngine, RecoveryMode
 
 
 def test_full_recovery(fat32_image, tmp_path):
@@ -84,3 +85,53 @@ def test_reconstruction_export_finishes_without_duplicate_objects(
     assert len(object_keys) == len(set(object_keys))
     assert any("Rekonstrukcja obiektów:" in message for message in progress_messages)
     assert progress_messages[-1] == "Gotowe"
+
+
+def test_target_only_skips_root_export_and_can_export_committed_results(
+    fat32_image, tmp_path, monkeypatch
+):
+    out = tmp_path / "target_only"
+    engine = RecoveryEngine(
+        fat32_image["path"],
+        out,
+        target_name="bhp szkoły",
+        enable_raw=True,
+        deep_scan=True,
+        mode=RecoveryMode.TARGET_ONLY,
+    )
+
+    def fail_root_export(*_args, **_kwargs):
+        raise AssertionError("TARGET_ONLY nie może eksportować katalogu głównego")
+
+    monkeypatch.setattr(engine, "_export_other_root_entries", fail_root_export)
+    try:
+        session = engine.run()
+    finally:
+        engine.close()
+
+    assert session.stats["w_docelowym"] >= 2
+    assert not any(item.category in {"unknown", "orphan", "raw"} for item in session.items)
+    assert session.checkpoint_path
+    checkpoint = CheckpointStore(session.checkpoint_path)
+    checkpoint.open()
+    try:
+        meta = checkpoint.load_meta()
+    finally:
+        checkpoint.close()
+    assert meta is not None
+    assert meta.recovery_mode == RecoveryMode.TARGET_ONLY.value
+    assert meta.complete is True
+
+    exported = RecoveryEngine(
+        fat32_image["path"],
+        out,
+        target_name="bhp szkoły",
+        mode=RecoveryMode.TARGET_ONLY,
+    )
+    try:
+        live = exported.export_live_results(categories={"target"})
+    finally:
+        exported.close()
+    assert live.items
+    assert all(item.category == "target" for item in live.items)
+    assert any(item.path.endswith("NOTATKA.TXT") for item in live.items)

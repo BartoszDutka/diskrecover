@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from diskrecover.core.recovery import RecoveryEngine
+from diskrecover.core.recovery import RecoveryEngine, RecoveryMode
 from diskrecover.core.telemetry import log_exception
 
 
@@ -74,6 +74,7 @@ class RecoverWorker(QThread):
         *,
         resume_checkpoint: str | None = None,
         checkpoint_interval_sec: float = 300.0,
+        mode: RecoveryMode = RecoveryMode.FULL_RECOVERY,
     ) -> None:
         super().__init__()
         self.engine = RecoveryEngine(
@@ -85,6 +86,7 @@ class RecoverWorker(QThread):
             deep_scan=deep_scan,
             resume_checkpoint=resume_checkpoint,
             checkpoint_interval_sec=checkpoint_interval_sec,
+            mode=mode,
         )
         self._last_telemetry_emit = 0.0
         self._last_stage = ""

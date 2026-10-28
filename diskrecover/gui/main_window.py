@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -33,7 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from diskrecover.core.checkpoint import ResultStore, default_checkpoint_dir
-from diskrecover.core.recovery import RecoveryEngine, available_checkpoints
+from diskrecover.core.recovery import RecoveryEngine, RecoveryMode, available_checkpoints
 from diskrecover.gui.theme import DARK_QSS
 from diskrecover.gui.workers import AnalyzeWorker, RecoverWorker
 
@@ -182,6 +183,17 @@ class MainWindow(QMainWindow):
         self.chk_deep.setChecked(True)
         ov.addWidget(self.chk_raw)
         ov.addWidget(self.chk_deep)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem(
+            "TARGET_ONLY — tylko bhp szkoły",
+            RecoveryMode.TARGET_ONLY.value,
+        )
+        self.mode_combo.addItem(
+            "FULL_RECOVERY — cały wolumin",
+            RecoveryMode.FULL_RECOVERY.value,
+        )
+        ov.addWidget(QLabel("Tryb odzyskiwania:"))
+        ov.addWidget(self.mode_combo)
         note = QLabel(
             "Pliki RAW trafiają wyłącznie do folderu RAW/ i nigdy nie są przypisywane "
             "do „bhp szkoły” bez dowodu. Niepewne → Nieustalone_pochodzenie/."
@@ -457,6 +469,7 @@ class MainWindow(QMainWindow):
             self.chk_deep.isChecked(),
             resume_checkpoint=resume_checkpoint,
             checkpoint_interval_sec=float(self.ckpt_interval.value()),
+            mode=RecoveryMode(self.mode_combo.currentData()),
         )
         self._recover_worker.progress.connect(self._on_recover_progress)
         self._recover_worker.telemetry.connect(self._on_telemetry)

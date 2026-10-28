@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from diskrecover import __version__
+from diskrecover.core.recovery import RecoveryMode
 
 
 DEFAULT_IMAGE = r"C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive_bhp.bin"
@@ -36,10 +37,30 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
     r.add_argument("-o", "--output", required=True, help="Katalog wyjściowy")
     r.add_argument("--target", default=DEFAULT_TARGET, help="Nazwa katalogu docelowego")
+    r.add_argument(
+        "--target-cluster",
+        type=int,
+        default=None,
+        help="Znany klaster nadrzędny katalogu docelowego, np. 1843110",
+    )
     r.add_argument("--partition-lba", type=int, default=None)
     r.add_argument("--no-raw", action="store_true", help="Wyłącz carving RAW")
     r.add_argument("--shallow", action="store_true", help="Bez głębokiego skanu klastrów")
     r.add_argument("--json", action="store_true", help="Podsumowanie JSON na stdout")
+    r.add_argument(
+        "--mode",
+        choices=[mode.value for mode in RecoveryMode],
+        default=RecoveryMode.FULL_RECOVERY.value,
+        help="TARGET_ONLY pomija eksport innych katalogów; FULL_RECOVERY eksportuje cały wolumin",
+    )
+
+    e = sub.add_parser(
+        "export-target",
+        help="Eksportuj już zapisane rekordy target z results.sqlite bez skanowania",
+    )
+    e.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
+    e.add_argument("-o", "--output", required=True, help="Katalog wyników z Raport/results.sqlite")
+    e.add_argument("--target", default=DEFAULT_TARGET)
 
     d = sub.add_parser(
         "diagnose-candidate",
@@ -109,6 +130,8 @@ def cmd_recover(args: argparse.Namespace) -> int:
         partition_lba=args.partition_lba,
         enable_raw=not args.no_raw,
         deep_scan=not args.shallow,
+        mode=RecoveryMode(args.mode),
+        target_cluster=args.target_cluster,
     )
     try:
         session = engine.run(progress_cb=progress)
@@ -125,6 +148,25 @@ def cmd_recover(args: argparse.Namespace) -> int:
     print("Raporty w:", Path(args.output) / "Raport")
     if args.json:
         print(json.dumps(session.stats, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_export_target(args: argparse.Namespace) -> int:
+    from diskrecover.core.recovery import RecoveryEngine
+
+    path = Path(args.image)
+    if not path.is_file():
+        print(f"Błąd: nie znaleziono obrazu: {path}", file=sys.stderr)
+        return 2
+    engine = RecoveryEngine(path, args.output, target_name=args.target)
+    try:
+        session = engine.export_live_results(categories={"target"})
+    except Exception as exc:
+        print(f"Błąd eksportu: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.close()
+    print("Wyeksportowano zapisane rekordy target:", session.stats)
     return 0
 
 
@@ -186,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_analyze(args)
     if args.cmd == "recover":
         return cmd_recover(args)
+    if args.cmd == "export-target":
+        return cmd_export_target(args)
     if args.cmd == "diagnose-candidate":
         return cmd_diagnose_candidate(args)
     parser.print_help()

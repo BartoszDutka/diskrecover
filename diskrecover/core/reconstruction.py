@@ -889,6 +889,7 @@ def reconstruct_target(
     node_cb: Optional[Callable[[RecoveredNode], None]] = None,
     budget_factory: Optional[Callable[[], CandidateBudget]] = None,
     retry_deferred: bool = False,
+    target_cluster_hint: Optional[int] = None,
 ) -> ReconstructionResult:
     messages: List[str] = []
     orphan_candidates: List[int] = []
@@ -921,7 +922,7 @@ def reconstruct_target(
         damaged_name_hits=damaged_hits,
     )
     nodes: List[RecoveredNode] = []
-    target_cluster: Optional[int] = None
+    target_cluster: Optional[int] = target_cluster_hint
     target_intact = False
     known: Set[int] = {vol.bpb.root_cluster}
 
@@ -937,7 +938,10 @@ def reconstruct_target(
             return (0 if e.is_deleted else 1, kids, -e.cluster)
 
         matches.sort(key=score, reverse=True)
-        best = matches[0]
+        best = next(
+            (match for match in matches if match.cluster == target_cluster_hint),
+            matches[0],
+        )
         target_cluster = best.cluster
         target_intact = True
         messages.append(
