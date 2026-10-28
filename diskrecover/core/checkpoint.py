@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 CHECKPOINT_FORMAT_ID = "diskrecover-checkpoint"
 CHECKPOINT_VERSION = 2
+RESULTS_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -371,6 +372,207 @@ class CheckpointStore:
         if meta.image is None:
             errors.append("brak odcisku obrazu")
         return errors
+
+
+class ResultStore:
+    """WAL-backed live results and candidate queue.
+
+    This database is deliberately separate from the atomically replaced
+    scan checkpoint, so the GUI can read it while a worker is scanning.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def open(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                return
+            self._conn = sqlite3.connect(
+                str(self.path), check_same_thread=False, isolation_level=None
+            )
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS schema_info (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS result_objects (
+                    object_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    object_type TEXT NOT NULL,
+                    cluster INTEGER NOT NULL,
+                    entry_offset INTEGER,
+                    parent_cluster INTEGER,
+                    category TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    evidence TEXT NOT NULL,
+                    integrity TEXT NOT NULL,
+                    exported INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS candidate_queue (
+                    candidate_id TEXT PRIMARY KEY,
+                    cluster INTEGER NOT NULL,
+                    sequence_no INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    safe_stage TEXT NOT NULL,
+                    reads INTEGER NOT NULL DEFAULT 0,
+                    clusters INTEGER NOT NULL DEFAULT 0,
+                    records INTEGER NOT NULL DEFAULT 0,
+                    progress REAL NOT NULL DEFAULT 0,
+                    started_at REAL,
+                    finished_at REAL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_candidate_sequence
+                    ON candidate_queue(sequence_no);
+                """
+            )
+            self._conn.execute(
+                "INSERT INTO schema_info(key,value) VALUES('version',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(RESULTS_SCHEMA_VERSION),),
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+    def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        self.open()
+        assert self._conn is not None
+        return self._conn.execute(sql, params)
+
+    def upsert_objects(self, records: Sequence[dict]) -> int:
+        if not records:
+            return 0
+        with self._lock:
+            self.open()
+            assert self._conn is not None
+            now = time.time()
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.executemany(
+                    """
+                    INSERT INTO result_objects(
+                        object_id,name,path,size,object_type,cluster,entry_offset,
+                        parent_cluster,category,confidence,evidence,integrity,
+                        exported,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(object_id) DO UPDATE SET
+                        name=excluded.name,path=excluded.path,size=excluded.size,
+                        object_type=excluded.object_type,cluster=excluded.cluster,
+                        entry_offset=excluded.entry_offset,
+                        parent_cluster=excluded.parent_cluster,
+                        category=excluded.category,confidence=excluded.confidence,
+                        evidence=excluded.evidence,integrity=excluded.integrity,
+                        updated_at=excluded.updated_at
+                    """,
+                    [
+                        (
+                            str(r["object_id"]), str(r.get("name") or ""),
+                            str(r.get("path") or ""), int(r.get("size") or 0),
+                            str(r.get("object_type") or "file"),
+                            int(r.get("cluster") or -1), r.get("entry_offset"),
+                            r.get("parent_cluster"), str(r.get("category") or "unknown"),
+                            str(r.get("confidence") or "nieustalone"),
+                            json.dumps(list(r.get("evidence") or []), ensure_ascii=False),
+                            str(r.get("integrity") or "niezweryfikowany"),
+                            int(bool(r.get("exported", False))), now,
+                        )
+                        for r in records
+                    ],
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return len(records)
+
+    def list_objects(self, categories: Optional[Sequence[str]] = None) -> List[dict]:
+        with self._lock:
+            query = "SELECT * FROM result_objects"
+            args: list = []
+            if categories:
+                placeholders = ",".join("?" for _ in categories)
+                query += f" WHERE category IN ({placeholders})"
+                args.extend(categories)
+            query += " ORDER BY object_id"
+            rows = self._execute(query, tuple(args)).fetchall()
+            return [
+                {
+                    "object_id": r[0], "name": r[1], "path": r[2], "size": r[3],
+                    "object_type": r[4], "cluster": r[5], "entry_offset": r[6],
+                    "parent_cluster": r[7], "category": r[8], "confidence": r[9],
+                    "evidence": json.loads(r[10]), "integrity": r[11],
+                    "exported": bool(r[12]), "updated_at": r[13],
+                }
+                for r in rows
+            ]
+
+    def upsert_candidate(self, candidate_id: str, cluster: int, sequence_no: int,
+                         status: str, *, safe_stage: str = "", reads: int = 0,
+                         clusters: int = 0, records: int = 0, progress: float = 0,
+                         started_at: Optional[float] = None,
+                         finished_at: Optional[float] = None,
+                         reason: str = "", state: Optional[dict] = None) -> None:
+        with self._lock:
+            self._execute(
+                """
+                INSERT INTO candidate_queue(
+                    candidate_id,cluster,sequence_no,status,safe_stage,reads,
+                    clusters,records,progress,started_at,finished_at,reason,state,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                    cluster=excluded.cluster,sequence_no=excluded.sequence_no,
+                    status=excluded.status,safe_stage=excluded.safe_stage,
+                    reads=excluded.reads,clusters=excluded.clusters,
+                    records=excluded.records,progress=excluded.progress,
+                    started_at=excluded.started_at,finished_at=excluded.finished_at,
+                    reason=excluded.reason,state=excluded.state,updated_at=excluded.updated_at
+                """,
+                (candidate_id, int(cluster), int(sequence_no), status, safe_stage,
+                 int(reads), int(clusters), int(records), float(progress),
+                 started_at, finished_at, reason,
+                 json.dumps(state or {}, ensure_ascii=False), time.time()),
+            )
+
+    def list_candidates(self, status: Optional[str] = None) -> List[dict]:
+        with self._lock:
+            sql = "SELECT * FROM candidate_queue"
+            args: tuple = ()
+            if status:
+                sql += " WHERE status=?"
+                args = (status,)
+            sql += " ORDER BY sequence_no"
+            return [
+                {
+                    "candidate_id": r[0], "cluster": r[1], "sequence_no": r[2],
+                    "status": r[3], "safe_stage": r[4], "reads": r[5],
+                    "clusters": r[6], "records": r[7], "progress": r[8],
+                    "started_at": r[9], "finished_at": r[10], "reason": r[11],
+                    "state": json.loads(r[12]), "updated_at": r[13],
+                }
+                for r in self._execute(sql, args).fetchall()
+            ]
+
+    def mark_exported(self, object_id: str) -> None:
+        with self._lock:
+            self._execute(
+                "UPDATE result_objects SET exported=1, updated_at=? WHERE object_id=?",
+                (time.time(), object_id),
+            )
 
 
 def atomic_checkpoint_write(store: CheckpointStore, writer_cb) -> Path:

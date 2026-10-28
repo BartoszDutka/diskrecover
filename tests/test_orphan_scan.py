@@ -7,6 +7,7 @@ from diskrecover.core.directory import looks_like_directory_cluster, parent_clus
 from diskrecover.core.fat32 import Fat32Volume
 from diskrecover.core.image import ImageReader
 from diskrecover.core.reconstruction import (
+    CandidateBudget,
     find_orphan_directories,
     flatten_nodes,
     reconstruct_target,
@@ -105,3 +106,34 @@ def test_counters_reflect_real_operations(fat32_image):
         assert result.tracker.unique_clusters_analyzed > 0
         # Ponowne odczyty mogą istnieć (FAT/deep), ale nie powinny dominować ekstremalnie
         assert result.tracker.reread_count < result.tracker.total_cluster_reads * 5
+
+
+def test_expensive_candidate_is_deferred_and_retryable(fat32_image):
+    with ImageReader(fat32_image["path"]) as reader:
+        vol = Fat32Volume.open(reader, fat32_image["partition_offset"])
+        events = []
+
+        def candidate_cb(candidate_id, cluster, status, data):
+            events.append((candidate_id, cluster, status, data))
+
+        find_orphan_directories(
+            vol,
+            set(),
+            candidate_clusters=[11],
+            target_cluster=3,
+            candidate_cb=candidate_cb,
+            budget_factory=lambda: CandidateBudget(max_records=0),
+        )
+        assert any(event[2] == "DEFERRED" for event in events)
+
+        events.clear()
+        orphans, linked = find_orphan_directories(
+            vol,
+            set(),
+            candidate_clusters=[11],
+            target_cluster=3,
+            candidate_cb=candidate_cb,
+            budget_factory=lambda: CandidateBudget(max_records=1000),
+        )
+        assert linked
+        assert any(event[2] == "COMPLETED" for event in events)

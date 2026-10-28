@@ -68,6 +68,20 @@ Zakładka **Skanowanie** zawiera:
 
 Auto-zapis: co N sekund (domyślnie 300), po etapach oraz po N kandydatch osieroconych.
 
+Po zakończeniu rekonstrukcji checkpoint zawiera także wersjonowany snapshot
+odnalezionych węzłów (nazwy, rozmiary, klastry, relacje, dowody i poziomy
+pewności). Zakładka **Wyniki** może wczytać ten snapshot bez wznawiania skanu;
+obiekty wczytane przed eksportem są wyraźnie oznaczone jako niewyeksportowane.
+Starsze checkpointy, które zawierają wyłącznie statystyki, nie są traktowane
+jak pełne wyniki i zgłaszają brak snapshotu.
+
+Podczas skanowania bieżące wyniki są dodatkowo zapisywane partiami do
+`Raport/results.sqlite` w trybie WAL. Baza zawiera pełne rekordy obiektów oraz
+kolejkę kandydatów (`PENDING`, `RUNNING`, `COMPLETED`, `DEFERRED`, `FAILED`),
+więc przycisk **Odśwież wyniki** działa także podczas pauzy lub skanowania.
+Kandydat przekraczający budżet czasu, odczytów, klastrów albo rekordów trafia
+do `DEFERRED` i nie jest oznaczany jako nieodzyskiwalny.
+
 Osierocone podfoldery z wpisem `..` wskazującym klaster katalogu docelowego
 (np. `1843110` dla `bhp szkoły`) są oznaczane osobno i eksportowane do
 `Odtworzony_bhp_szkoly/` z poziomem pewności „wysokie”.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -65,6 +66,33 @@ class ReconstructionResult:
     profile_report: str = ""
     orphan_candidates: List[int] = field(default_factory=list)
     already_checked: List[int] = field(default_factory=list)
+
+
+@dataclass
+class CandidateBudget:
+    max_seconds: float = 300.0
+    max_reads: int = 100_000
+    max_clusters: int = 100_000
+    max_records: int = 1_000_000
+    started_at: float = field(default_factory=time.monotonic)
+    reads: int = 0
+    clusters: int = 0
+    records: int = 0
+    depth: int = 0
+
+    def check(self) -> None:
+        if time.monotonic() - self.started_at > self.max_seconds:
+            raise CandidateDeferred("time budget exceeded")
+        if self.reads > self.max_reads:
+            raise CandidateDeferred("read budget exceeded")
+        if self.clusters > self.max_clusters:
+            raise CandidateDeferred("cluster budget exceeded")
+        if self.records > self.max_records:
+            raise CandidateDeferred("record budget exceeded")
+
+
+class CandidateDeferred(RuntimeError):
+    """A candidate exceeded its budget and remains eligible for retry."""
 
 
 ProgressCb = Optional[Callable[[int, str], None]]
@@ -277,12 +305,17 @@ def build_tree_from_directory(
     visited: Optional[Set[int]] = None,
     tracker: Optional[ClusterTracker] = None,
     emit_activity: bool = True,
+    budget: Optional[CandidateBudget] = None,
+    node_cb: Optional[Callable[[RecoveredNode], None]] = None,
 ) -> List[RecoveredNode]:
     if visited is None:
         visited = set()
     if start_cluster in visited or max_depth < 0:
         return []
     visited.add(start_cluster)
+    if budget:
+        budget.clusters += 1
+        budget.check()
     nodes: List[RecoveredNode] = []
     try:
         entries = read_directory(
@@ -297,6 +330,9 @@ def build_tree_from_directory(
         return []
 
     for e in entries:
+        if budget:
+            budget.records += 1
+            budget.check()
         if e.is_dot or e.is_volume_label:
             continue
         if e.cluster < 2 and not e.is_directory:
@@ -353,8 +389,12 @@ def build_tree_from_directory(
                     visited=visited,
                     tracker=tracker,
                     emit_activity=emit_activity,
+                    budget=budget,
+                    node_cb=node_cb,
                 )
         nodes.append(node)
+        if node_cb:
+            node_cb(node)
     return nodes
 
 
@@ -382,6 +422,10 @@ def find_orphan_directories(
     target_name: str = "bhp szkoły",
     profiler: Optional[Profiler] = None,
     already_checked: Optional[Set[int]] = None,
+    candidate_cb: Optional[Callable[[str, int, str, dict], None]] = None,
+    node_cb: Optional[Callable[[RecoveredNode], None]] = None,
+    budget_factory: Optional[Callable[[], CandidateBudget]] = None,
+    retry_deferred: bool = False,
 ) -> Tuple[List[RecoveredNode], List[RecoveredNode]]:
     """
     Katalogi z . / .. niepowiązane ze znanym drzewem.
@@ -457,16 +501,37 @@ def find_orphan_directories(
                 f"(pozostało {remaining})",
             )
 
+        candidate_id = f"cluster:{c}"
+        if candidate_cb and c not in already_checked:
+            candidate_cb(candidate_id, c, "PENDING", {"sequence_no": i})
+
         if c in known_clusters or c in already_checked:
             checked += 1
             already_checked.add(c)
+            if candidate_cb:
+                candidate_cb(candidate_id, c, "COMPLETED", {
+                    "sequence_no": i, "reason": "already checked",
+                    "finished_at": time.time(), "progress": 100,
+                })
             continue
+
+        budget = budget_factory() if budget_factory else None
+        started = time.time()
+        if candidate_cb:
+            candidate_cb(candidate_id, c, "RUNNING", {
+                "sequence_no": i, "started_at": started
+            })
 
         if tracker.is_skip_candidate(c):
             # Już część przeanalizowanego łańcucha / katalogu — nie buduj ponownie
             checked += 1
             rejected += 1
             already_checked.add(c)
+            if candidate_cb:
+                candidate_cb(candidate_id, c, "COMPLETED", {
+                    "sequence_no": i, "reason": "already analyzed",
+                    "finished_at": time.time(), "progress": 100
+                })
             _telem(
                 orphan_candidates_checked=1,
                 orphan_candidates_rejected=1,
@@ -474,10 +539,30 @@ def find_orphan_directories(
             continue
 
         try:
+            if budget:
+                budget.reads += 1
+                budget.check()
             with profiler.span("orphan_read_cluster"):
                 tracker.note_read(c)
                 data = vol.read_cluster(c)
+        except CandidateDeferred as exc:
+            if candidate_cb:
+                candidate_cb(candidate_id, c, "DEFERRED", {
+                    "sequence_no": i, "reason": str(exc),
+                    "finished_at": time.time(),
+                    "reads": budget.reads if budget else 0,
+                    "clusters": budget.clusters if budget else 0,
+                    "records": budget.records if budget else 0,
+                    "progress": 0,
+                })
+            # The candidate is intentionally not added to already_checked.
+            continue
         except Exception:
+            if candidate_cb:
+                candidate_cb(candidate_id, c, "FAILED", {
+                    "sequence_no": i, "reason": "odczyt klastra nieudany",
+                    "finished_at": time.time(),
+                })
             checked += 1
             rejected += 1
             already_checked.add(c)
@@ -517,6 +602,19 @@ def find_orphan_directories(
         # Parsuj raz z już odczytanego bufora — bez ponownego read_cluster
         with profiler.span("orphan_parse"):
             ents = scan_cluster_as_directory(vol, c, data=data, tracker=tracker)
+        if budget:
+            budget.records += len(ents)
+            try:
+                budget.check()
+            except CandidateDeferred as exc:
+                if candidate_cb:
+                    candidate_cb(candidate_id, c, "DEFERRED", {
+                        "sequence_no": i, "reason": str(exc),
+                        "finished_at": time.time(),
+                        "reads": budget.reads, "clusters": budget.clusters,
+                        "records": budget.records, "progress": 0,
+                    })
+                continue
         parent = parent_cluster_from_dotdot(ents)
         self_cl = self_cluster_from_dot(ents)
 
@@ -545,16 +643,30 @@ def find_orphan_directories(
         # Buduj drzewo tylko jeśli start nie był jeszcze odwiedzony
         children: List[RecoveredNode] = []
         if c not in shared_visited:
-            with profiler.span("orphan_build_tree"):
-                children = build_tree_from_directory(
-                    vol,
-                    c,
-                    name,
-                    belongs_to_target=belongs,
-                    visited=shared_visited,
-                    tracker=tracker,
-                    emit_activity=True,
-                )
+            try:
+                with profiler.span("orphan_build_tree"):
+                    children = build_tree_from_directory(
+                        vol,
+                        c,
+                        name,
+                        belongs_to_target=belongs,
+                        visited=shared_visited,
+                        tracker=tracker,
+                        emit_activity=True,
+                        budget=budget,
+                        node_cb=node_cb,
+                    )
+            except CandidateDeferred as exc:
+                if candidate_cb:
+                    candidate_cb(candidate_id, c, "DEFERRED", {
+                        "sequence_no": i, "reason": str(exc),
+                        "finished_at": time.time(),
+                        "reads": budget.reads if budget else 0,
+                        "clusters": budget.clusters if budget else 0,
+                        "records": budget.records if budget else 0,
+                        "progress": 0,
+                    })
+                continue
         else:
             # Cache / wcześniejsza wizyta — użyj cache bez rekurencji
             cached = tracker.get_cached(c)
@@ -588,6 +700,8 @@ def find_orphan_directories(
             parent_cluster=parent,
             link_confidence=link_conf if belongs else None,
         )
+        if node_cb:
+            node_cb(node)
 
         if belongs:
             linked.append(node)
@@ -605,6 +719,14 @@ def find_orphan_directories(
                 orphan_candidates_checked=1,
                 orphan_directories_confirmed=1,
             )
+        if candidate_cb:
+            candidate_cb(candidate_id, c, "COMPLETED", {
+                "sequence_no": i, "finished_at": time.time(),
+                "progress": 100, "reads": budget.reads if budget else 1,
+                "clusters": budget.clusters if budget else 1,
+                "records": budget.records if budget else len(ents),
+            })
+        continue
 
         if telemetry_cb and hasattr(telemetry_cb, "__call__"):
             # prędkość
@@ -640,6 +762,10 @@ def reconstruct_target(
     tracker: Optional[ClusterTracker] = None,
     profiler: Optional[Profiler] = None,
     resume_state: Optional[dict] = None,
+    candidate_cb: Optional[Callable[[str, int, str, dict], None]] = None,
+    node_cb: Optional[Callable[[RecoveredNode], None]] = None,
+    budget_factory: Optional[Callable[[], CandidateBudget]] = None,
+    retry_deferred: bool = False,
 ) -> ReconstructionResult:
     messages: List[str] = []
     orphan_candidates: List[int] = []
@@ -704,6 +830,7 @@ def reconstruct_target(
             belongs_to_target=True,
             visited=known,
             tracker=tracker,
+            node_cb=node_cb,
         )
 
         def collect(nlist: List[RecoveredNode]) -> None:
@@ -748,6 +875,10 @@ def reconstruct_target(
         target_name=target_name,
         profiler=profiler,
         already_checked=already_checked,
+        candidate_cb=candidate_cb,
+        node_cb=node_cb,
+        budget_factory=budget_factory,
+        retry_deferred=retry_deferred,
     )
 
     # Orphany z nazwą zawierającą target — MEDIUM, bez automatycznego belongs

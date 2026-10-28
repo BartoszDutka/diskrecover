@@ -18,6 +18,7 @@ from diskrecover.core.checkpoint import (
     default_checkpoint_dir,
     fingerprint_image,
     list_checkpoints,
+    ResultStore,
 )
 from diskrecover.core.cluster_tracker import ClusterTracker
 from diskrecover.core.directory import names_match, read_directory
@@ -33,6 +34,7 @@ from diskrecover.core.reconstruction import (
     build_tree_from_directory,
     flatten_nodes,
     reconstruct_target,
+    CandidateBudget,
 )
 from diskrecover.core.report import write_reports
 from diskrecover.core.telemetry import (
@@ -88,6 +90,71 @@ class RecoverySession:
     profile_report: str = ""
 
 
+def _node_to_dict(node: RecoveredNode) -> dict:
+    return {
+        "name": node.name,
+        "path": node.path,
+        "cluster": node.cluster,
+        "size": node.size,
+        "is_directory": node.is_directory,
+        "is_deleted": node.is_deleted,
+        "confidence": node.confidence.value,
+        "evidence": list(node.evidence),
+        "belongs_to_target": node.belongs_to_target,
+        "is_candidate": node.is_candidate,
+        "parent_cluster": node.parent_cluster,
+        "link_confidence": node.link_confidence.value if node.link_confidence else None,
+        "children": [_node_to_dict(child) for child in node.children],
+    }
+
+
+def _node_from_dict(raw: dict) -> RecoveredNode:
+    link_confidence = raw.get("link_confidence")
+    return RecoveredNode(
+        name=str(raw.get("name") or ""),
+        path=str(raw.get("path") or ""),
+        cluster=int(raw.get("cluster") or -1),
+        size=int(raw.get("size") or 0),
+        is_directory=bool(raw.get("is_directory")),
+        is_deleted=bool(raw.get("is_deleted")),
+        confidence=Confidence(raw.get("confidence") or Confidence.UNKNOWN.value),
+        evidence=[str(value) for value in raw.get("evidence") or []],
+        belongs_to_target=bool(raw.get("belongs_to_target")),
+        is_candidate=bool(raw.get("is_candidate")),
+        parent_cluster=raw.get("parent_cluster"),
+        link_confidence=Confidence(link_confidence) if link_confidence else None,
+        children=[_node_from_dict(child) for child in raw.get("children") or []],
+    )
+
+
+def _partial_items(nodes: List[RecoveredNode], category: str) -> List[RecoveryItem]:
+    items: List[RecoveryItem] = []
+
+    def visit(node: RecoveredNode, parent: str) -> None:
+        safe_path = str(Path(parent) / safe_filename(node.name))
+        item_category = category if node.belongs_to_target or category != "target" else "unknown"
+        items.append(
+            RecoveryItem(
+                path=node.path,
+                output_path=safe_path,
+                cluster=node.cluster,
+                size=node.size,
+                confidence=node.confidence.value,
+                category=item_category,
+                evidence=list(node.evidence),
+                is_directory=node.is_directory,
+                is_deleted=node.is_deleted,
+                exported=False,
+            )
+        )
+        for child in node.children:
+            visit(child, safe_path)
+
+    for node in nodes:
+        visit(node, category)
+    return items
+
+
 ProgressCb = Optional[Callable[[int, str], None]]
 TelemetryCb = Optional[Callable[[ScanSnapshot], None]]
 CheckpointCb = Optional[Callable[[str, float], None]]
@@ -108,6 +175,11 @@ class RecoveryEngine:
         checkpoint_interval_sec: float = 300.0,
         checkpoint_every_candidates: int = 500,
         resume_checkpoint: Optional[str | Path] = None,
+        candidate_max_seconds: float = 300.0,
+        candidate_max_reads: int = 100_000,
+        candidate_max_clusters: int = 100_000,
+        candidate_max_records: int = 1_000_000,
+        retry_deferred: bool = False,
     ) -> None:
         self.image_path = Path(image_path)
         self.output_dir = Path(output_dir)
@@ -118,6 +190,11 @@ class RecoveryEngine:
         self.checkpoint_interval_sec = checkpoint_interval_sec
         self.checkpoint_every_candidates = checkpoint_every_candidates
         self.resume_checkpoint = Path(resume_checkpoint) if resume_checkpoint else None
+        self.candidate_max_seconds = candidate_max_seconds
+        self.candidate_max_reads = candidate_max_reads
+        self.candidate_max_clusters = candidate_max_clusters
+        self.candidate_max_records = candidate_max_records
+        self.retry_deferred = retry_deferred
 
         self._cancel = False
         self._pause = threading.Event()
@@ -146,6 +223,88 @@ class RecoveryEngine:
         self._checkpoint_cb: CheckpointCb = None
         self._latest_recon: Optional[ReconstructionResult] = None
         self._ckpt_store: Optional[CheckpointStore] = None
+        self._result_store: Optional[ResultStore] = None
+        self._result_batch: List[dict] = []
+        self._result_batch_size = 32
+
+    def results_path(self) -> Path:
+        return self.output_dir / "Raport" / "results.sqlite"
+
+    def _ensure_result_store(self) -> ResultStore:
+        if self._result_store is None:
+            self._result_store = ResultStore(self.results_path())
+            self._result_store.open()
+        return self._result_store
+
+    def _persist_node(self, node: RecoveredNode) -> None:
+        entry = node.source_entry
+        object_id = (
+            f"entry:{entry.raw_offset}"
+            if entry is not None
+            else f"{node.path}|{node.cluster}|{int(node.is_directory)}"
+        )
+        self._result_batch.append({
+            "object_id": object_id,
+            "name": node.name,
+            "path": node.path,
+            "size": node.size,
+            "object_type": "directory" if node.is_directory else "file",
+            "cluster": node.cluster,
+            "entry_offset": entry.raw_offset if entry is not None else None,
+            "parent_cluster": node.parent_cluster,
+            "category": "target" if node.belongs_to_target else (
+                "orphan" if node.is_candidate else "unknown"
+            ),
+            "confidence": node.confidence.value,
+            "evidence": node.evidence,
+            "integrity": "niezweryfikowany",
+        })
+        if len(self._result_batch) >= self._result_batch_size:
+            self._flush_result_batch()
+
+    def _flush_result_batch(self) -> None:
+        if self._result_batch:
+            self._ensure_result_store().upsert_objects(self._result_batch)
+            self._result_batch.clear()
+
+    def _persist_candidate(self, candidate_id: str, cluster: int,
+                           status: str, data: dict) -> None:
+        self._ensure_result_store().upsert_candidate(
+            candidate_id, cluster, int(data.get("sequence_no", 0)), status,
+            safe_stage=str(data.get("safe_stage") or ""),
+            reads=int(data.get("reads") or 0),
+            clusters=int(data.get("clusters") or 0),
+            records=int(data.get("records") or 0),
+            progress=float(data.get("progress") or 0),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+            reason=str(data.get("reason") or ""),
+            state=data.get("state") or {},
+        )
+
+    @staticmethod
+    def load_live_results(path: str | Path) -> RecoverySession:
+        store = ResultStore(path)
+        store.open()
+        try:
+            objects = store.list_objects()
+        finally:
+            store.close()
+        items = [
+            RecoveryItem(
+                path=o["path"], output_path=o["path"], cluster=o["cluster"],
+                size=o["size"], confidence=o["confidence"], category=o["category"],
+                evidence=o["evidence"], is_directory=o["object_type"] == "directory",
+                exported=o["exported"],
+            )
+            for o in objects
+        ]
+        return RecoverySession(
+            image_path="", output_dir=str(Path(path).parents[1]),
+            target_name="bhp szkoły", volume_summary={},
+            items=items, stats={"zapisane_obiekty": len(items)},
+            checkpoint_path=str(path),
+        )
 
     def request_cancel(self) -> None:
         self._cancel = True
@@ -259,6 +418,28 @@ class RecoveryEngine:
                 )
                 store.replace_stats("global", telem)
                 store.save_json_blob("scan_state", state)
+                if self._latest_recon is not None:
+                    store.save_json_blob(
+                        "reconstruction_snapshot",
+                        {
+                            "version": 1,
+                            "target_name": self._latest_recon.target_name,
+                            "target_cluster": self._latest_recon.target_cluster,
+                            "target_found": self._latest_recon.target_found,
+                            "target_directory_intact": self._latest_recon.target_directory_intact,
+                            "nodes": [_node_to_dict(n) for n in self._latest_recon.nodes],
+                            "orphan_directories": [
+                                _node_to_dict(n)
+                                for n in self._latest_recon.orphan_directories
+                            ],
+                            "target_linked_orphans": [
+                                _node_to_dict(n)
+                                for n in self._latest_recon.target_linked_orphans
+                            ],
+                            "stats": dict(self._latest_recon.stats),
+                            "messages": list(self._latest_recon.messages),
+                        },
+                    )
                 store.save_json_blob("settings", {
                     "target_name": self.target_name,
                     "deep_scan": self.deep_scan,
@@ -305,6 +486,217 @@ class RecoveryEngine:
             if self._checkpoint_cb:
                 self._checkpoint_cb(str(path), saved_at)
             return path
+
+    @staticmethod
+    def load_partial_session(path: str | Path) -> RecoverySession:
+        """Load discovered objects from a checkpoint without resuming a scan."""
+        store = CheckpointStore(path)
+        store.open()
+        try:
+            meta = store.load_meta()
+            snapshot = store.load_json_blob("reconstruction_snapshot")
+            if meta is None or not snapshot:
+                stats = store.load_stats("global")
+                return RecoverySession(
+                    image_path=meta.image.path if meta and meta.image else "",
+                    output_dir=meta.output_dir if meta else "",
+                    target_name=meta.target_name if meta else "",
+                    volume_summary=dict(meta.volume_summary) if meta else {},
+                    stats=stats,
+                    messages=[
+                        "Checkpoint zawiera agregaty, ale nie zawiera "
+                        "trwałego snapshotu pełnych obiektów.",
+                    ],
+                    checkpoint_path=str(path),
+                )
+            target_nodes = [_node_from_dict(raw) for raw in snapshot.get("nodes") or []]
+            orphan_nodes = [
+                _node_from_dict(raw)
+                for raw in snapshot.get("orphan_directories") or []
+            ]
+            linked_nodes = [
+                _node_from_dict(raw)
+                for raw in snapshot.get("target_linked_orphans") or []
+            ]
+            items = _partial_items(target_nodes, "target")
+            items.extend(_partial_items(linked_nodes, "target"))
+            items.extend(_partial_items(orphan_nodes, "orphan"))
+            stats = dict(snapshot.get("stats") or {})
+            stats.setdefault("wyniki_czesciowe", len(items))
+            return RecoverySession(
+                image_path=meta.image.path if meta.image else "",
+                output_dir=meta.output_dir,
+                target_name=meta.target_name,
+                volume_summary=dict(meta.volume_summary),
+                items=items,
+                messages=list(snapshot.get("messages") or [])
+                + ["Wczytano snapshot częściowych wyników; pliki nie są jeszcze wyeksportowane."],
+                stats=stats,
+                checkpoint_path=str(path),
+            )
+        finally:
+            store.close()
+
+    def export_checkpoint_results(
+        self, path: str | Path, *, output_dir: str | Path | None = None
+    ) -> RecoverySession:
+        """Export the reconstructed objects stored in a checkpoint.
+
+        This opens the image read-only and never resumes or mutates scan state.
+        """
+        checkpoint = Path(path)
+        store = CheckpointStore(checkpoint)
+        store.open()
+        try:
+            errors = store.validate()
+            if errors:
+                raise ValueError("Checkpoint niepoprawny: " + "; ".join(errors))
+            meta = store.load_meta()
+            snapshot = store.load_json_blob("reconstruction_snapshot")
+            if meta is None or not snapshot:
+                raise ValueError(
+                    "Checkpoint nie zawiera trwałego snapshotu znalezionych obiektów"
+                )
+            target_nodes = [_node_from_dict(raw) for raw in snapshot.get("nodes") or []]
+            linked_nodes = [
+                _node_from_dict(raw)
+                for raw in snapshot.get("target_linked_orphans") or []
+            ]
+            orphan_nodes = [
+                _node_from_dict(raw)
+                for raw in snapshot.get("orphan_directories") or []
+            ]
+        finally:
+            store.close()
+
+        if output_dir is not None:
+            self.output_dir = Path(output_dir)
+        self._prepare_output()
+        self._ensure_result_store()
+        self.open_volume()
+        assert self.volume is not None
+        known_offsets: Set[int] = set()
+        items = self._export_tree(
+            self.volume,
+            target_nodes + linked_nodes,
+            self.output_dir / "Odtworzony_bhp_szkoly",
+            category="target",
+            known_offsets=known_offsets,
+        )
+        for orphan in orphan_nodes:
+            items.extend(
+                self._export_tree(
+                    self.volume,
+                    [orphan],
+                    self.output_dir / "Osierocone_katalogi",
+                    category="orphan",
+                    known_offsets=known_offsets,
+                )
+            )
+        return RecoverySession(
+            image_path=str(self.image_path),
+            output_dir=str(self.output_dir),
+            target_name=str(snapshot.get("target_name") or self.target_name),
+            volume_summary=self.volume.summary(),
+            items=items,
+            messages=["Wyeksportowano obiekty ze snapshotu checkpointu."],
+            stats={"plikow_lacznie": sum(not i.is_directory for i in items)},
+            checkpoint_path=str(checkpoint),
+        )
+
+    def export_live_results(
+        self, *, output_dir: str | Path | None = None,
+        categories: Optional[Set[str]] = None,
+        object_ids: Optional[Set[str]] = None,
+        paths: Optional[Set[str]] = None,
+    ) -> RecoverySession:
+        """Export records already committed to results.sqlite."""
+        store = ResultStore(self.results_path())
+        store.open()
+        try:
+            records = store.list_objects(
+                sorted(categories) if categories else None
+            )
+            if object_ids is not None:
+                records = [r for r in records if r["object_id"] in object_ids]
+            if paths is not None:
+                records = [r for r in records if r["path"] in paths]
+        finally:
+            store.close()
+        if output_dir is not None:
+            self.output_dir = Path(output_dir)
+        self._prepare_output()
+        self.open_volume()
+        assert self.volume is not None
+        items: List[RecoveryItem] = []
+        store = ResultStore(self.results_path())
+        store.open()
+        try:
+            for record in records:
+                if record["object_type"] == "directory":
+                    continue
+                node = RecoveredNode(
+                    name=safe_filename(Path(record["path"]).name),
+                    path=record["path"],
+                    cluster=record["cluster"],
+                    size=record["size"],
+                    is_directory=False,
+                    is_deleted=False,
+                    confidence=Confidence(record["confidence"]),
+                    evidence=record["evidence"],
+                    belongs_to_target=record["category"] == "target",
+                )
+                destination = (
+                    self.output_dir / "Odtworzony_bhp_szkoly"
+                    if record["category"] == "target"
+                    else self.output_dir / "Nieustalone_pochodzenie"
+                )
+                destination.mkdir(parents=True, exist_ok=True)
+                dest = destination / safe_filename(node.name)
+                if dest.exists():
+                    dest = destination / f"{dest.stem}_{record['cluster']}{dest.suffix}"
+                integrity = "uszkodzony"
+                written = 0
+                try:
+                    chain = self.volume.follow_chain(node.cluster)
+                    if not chain:
+                        integrity = "uszkodzony"
+                    else:
+                        written = self._write_file_from_clusters(
+                            self.volume, node, dest
+                        )
+                        integrity = (
+                            "poprawnie odzyskany"
+                            if written == node.size
+                            else "częściowo odzyskany"
+                        )
+                except (OSError, ValueError, RuntimeError):
+                    integrity = "uszkodzony"
+                items.append(
+                    RecoveryItem(
+                        path=node.path,
+                        output_path=str(dest.relative_to(self.output_dir)),
+                        cluster=node.cluster,
+                        size=written,
+                        confidence=node.confidence.value,
+                        category=record["category"],
+                        evidence=record["evidence"] + [f"integralność: {integrity}"],
+                        exported=written > 0 and integrity != "uszkodzony",
+                    )
+                )
+                if record["object_id"]:
+                    store.mark_exported(record["object_id"])
+        finally:
+            store.close()
+        return RecoverySession(
+            image_path=str(self.image_path),
+            output_dir=str(self.output_dir),
+            target_name=self.target_name,
+            volume_summary=self.volume.summary(),
+            items=items,
+            messages=["Wyeksportowano zapisane wyniki bieżące."],
+            stats={"plikow_lacznie": len(items)},
+        )
 
     def load_checkpoint(self, path: str | Path) -> CheckpointMeta:
         store = CheckpointStore(path)
@@ -542,7 +934,17 @@ class RecoveryEngine:
             tracker=self.tracker,
             profiler=self.profiler,
             resume_state=resume_state,
+            candidate_cb=self._persist_candidate,
+            node_cb=self._persist_node,
+            budget_factory=lambda: CandidateBudget(
+                max_seconds=self.candidate_max_seconds,
+                max_reads=self.candidate_max_reads,
+                max_clusters=self.candidate_max_clusters,
+                max_records=self.candidate_max_records,
+            ),
+            retry_deferred=self.retry_deferred,
         )
+        self._flush_result_batch()
         self._latest_recon = recon
         self._scan_state["target_cluster"] = recon.target_cluster
         self._scan_state["orphan_candidates"] = list(recon.orphan_candidates)
@@ -956,6 +1358,10 @@ class RecoveryEngine:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def close(self) -> None:
+        self._flush_result_batch()
+        if self._result_store is not None:
+            self._result_store.close()
+            self._result_store = None
         if self._ckpt_store is not None:
             self._ckpt_store.close()
             self._ckpt_store = None

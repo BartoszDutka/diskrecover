@@ -11,6 +11,7 @@ from diskrecover.core.checkpoint import (
     atomic_checkpoint_write,
     fingerprint_image,
     list_checkpoints,
+    ResultStore,
 )
 from diskrecover.core.fat32 import Fat32Volume
 from diskrecover.core.image import ImageReader
@@ -200,3 +201,66 @@ def test_reconstruct_profile_present(fat32_image):
         vol = Fat32Volume.open(reader, fat32_image["partition_offset"])
         result = reconstruct_target(vol, "bhp szkoły", deep_scan=True)
         assert "Profil wydajności" in result.profile_report
+
+
+def test_checkpoint_exposes_partial_reconstruction(fat32_image, tmp_path):
+    out = tmp_path / "partial"
+    engine = RecoveryEngine(
+        fat32_image["path"], out, enable_raw=False, deep_scan=True
+    )
+    try:
+        engine.run()
+        checkpoint = engine._checkpoint_path()
+    finally:
+        engine.close()
+
+    partial = RecoveryEngine.load_partial_session(checkpoint)
+    assert partial.items
+    assert all(not item.exported for item in partial.items)
+    assert partial.checkpoint_path == str(checkpoint)
+
+
+def test_checkpoint_without_reconstruction_reports_aggregate_only(
+    fat32_image, tmp_path
+):
+    engine = RecoveryEngine(
+        fat32_image["path"], tmp_path / "empty", enable_raw=False, deep_scan=False
+    )
+    try:
+        engine._prepare_output()
+        engine.open_volume()
+        checkpoint = engine.save_checkpoint(reason="before-reconstruction")
+    finally:
+        engine.close()
+
+    partial = RecoveryEngine.load_partial_session(checkpoint)
+    assert partial.items == []
+    assert "agregaty" in partial.messages[0]
+
+
+def test_live_results_and_candidate_queue_are_durable(fat32_image, tmp_path):
+    out = tmp_path / "live"
+    engine = RecoveryEngine(
+        fat32_image["path"], out, enable_raw=False, deep_scan=True
+    )
+    try:
+        engine.run()
+        db_path = engine.results_path()
+    finally:
+        engine.close()
+
+    store = ResultStore(db_path)
+    store.open()
+    try:
+        objects = store.list_objects()
+        candidates = store.list_candidates()
+    finally:
+        store.close()
+    assert objects
+    assert any(o["object_type"] == "file" for o in objects)
+    assert candidates
+    assert all(c["status"] in {"PENDING", "RUNNING", "COMPLETED", "DEFERRED", "FAILED"}
+               for c in candidates)
+
+    live = RecoveryEngine.load_live_results(db_path)
+    assert live.items

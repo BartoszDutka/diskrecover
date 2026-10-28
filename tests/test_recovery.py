@@ -31,6 +31,9 @@ def test_full_recovery(fat32_image, tmp_path):
     assert (out / "Raport" / "raport.html").is_file()
     assert (out / "Raport" / "raport.csv").is_file()
     assert (out / "Raport" / "checkpoint.json").is_file()
+    partial = RecoveryEngine.load_partial_session(session.checkpoint_path)
+    assert partial.items
+    assert any(item.path.endswith("NOTATKA.TXT") for item in partial.items)
 
     # Plik z oryginalną treścią
     notes = list((out / "Odtworzony_bhp_szkoly").rglob("NOTATKA.TXT"))

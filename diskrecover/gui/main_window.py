@@ -32,8 +32,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from diskrecover.core.checkpoint import default_checkpoint_dir
-from diskrecover.core.recovery import available_checkpoints
+from diskrecover.core.checkpoint import ResultStore, default_checkpoint_dir
+from diskrecover.core.recovery import RecoveryEngine, available_checkpoints
 from diskrecover.gui.theme import DARK_QSS
 from diskrecover.gui.workers import AnalyzeWorker, RecoverWorker
 
@@ -311,10 +311,22 @@ class MainWindow(QMainWindow):
         v.addWidget(self.table, 1)
 
         row = QHBoxLayout()
+        refresh_btn = QPushButton("Odśwież wyniki")
+        refresh_btn.clicked.connect(self._refresh_live_results)
+        load_btn = QPushButton("Wczytaj wyniki z checkpointu")
+        load_btn.clicked.connect(self._load_checkpoint_results)
+        export_selected_btn = QPushButton("Odzyskaj zaznaczone")
+        export_selected_btn.clicked.connect(self._export_selected_results)
+        export_target_btn = QPushButton("Odzyskaj powiązane z bhp szkoły")
+        export_target_btn.clicked.connect(self._export_target_results)
         open_btn = QPushButton("Otwórz katalog wyjściowy")
         open_btn.clicked.connect(self._open_output)
         report_btn = QPushButton("Otwórz raport HTML")
         report_btn.clicked.connect(self._open_report)
+        row.addWidget(refresh_btn)
+        row.addWidget(load_btn)
+        row.addWidget(export_selected_btn)
+        row.addWidget(export_target_btn)
         row.addWidget(open_btn)
         row.addWidget(report_btn)
         row.addStretch()
@@ -553,9 +565,11 @@ class MainWindow(QMainWindow):
                 self.stage_progress.setRange(0, 100)
             self.stage_progress.setValue(int(min(100, max(0, snapshot.stage_pct))))
             if snapshot.candidates_total:
+                done = snapshot.candidates_total - snapshot.candidates_remaining
+                candidate_pct = 100.0 * done / max(snapshot.candidates_total, 1)
                 self.stage_progress.setFormat(
-                    f"Etap: {snapshot.orphan_candidates_checked or int(snapshot.stage_pct)}% "
-                    f"({snapshot.candidates_total - snapshot.candidates_remaining}/"
+                    f"Etap: {candidate_pct:.1f}% "
+                    f"({done}/"
                     f"{snapshot.candidates_total} kandydatów)"
                 )
             else:
@@ -674,6 +688,89 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 2, QTableWidgetItem(str(item.size)))
             self.table.setItem(row, 3, QTableWidgetItem(item.confidence))
             self.table.setItem(row, 4, QTableWidgetItem(item.category))
+
+    def _load_checkpoint_results(self) -> None:
+        out = self.out_edit.text().strip()
+        checkpoints = [c for c in available_checkpoints(out) if c.get("valid")]
+        if not checkpoints:
+            QMessageBox.information(
+                self, "DiskRecover", "Brak poprawnych checkpointów."
+            )
+            return
+        dlg = CheckpointPickerDialog(checkpoints, self)
+        if dlg.exec() != QDialog.Accepted or not dlg.selected_path:
+            return
+        try:
+            session = RecoveryEngine.load_partial_session(dlg.selected_path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(
+                self, "DiskRecover", f"Nie można wczytać wyników:\n{exc}"
+            )
+            return
+        self._session = session
+        self._fill_results(session)
+        self.status.setText("Wczytano snapshot wyników z checkpointu.")
+        if not session.items:
+            self.stats_label.setText(
+                self.stats_label.text()
+                + "\nCheckpoint zawiera wyłącznie agregaty; brak zapisanych pełnych rekordów."
+            )
+
+    def _refresh_live_results(self) -> None:
+        path = Path(self.out_edit.text().strip()) / "Raport" / "results.sqlite"
+        if not path.is_file():
+            QMessageBox.information(self, "DiskRecover", "Brak bazy bieżących wyników.")
+            return
+        try:
+            session = RecoveryEngine.load_live_results(path)
+            store = ResultStore(path)
+            store.open()
+            try:
+                deferred = len(store.list_candidates("DEFERRED"))
+                stored = len(store.list_objects())
+            finally:
+                store.close()
+            self._session = session
+            self._fill_results(session)
+            self.stats_label.setText(
+                self.stats_label.text()
+                + f" | Zapisane obiekty: {stored} | Odroczone katalogi: {deferred}"
+            )
+            self.status.setText("Odświeżono wyniki zapisane w SQLite.")
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "DiskRecover", f"Nie można odświeżyć wyników:\n{exc}")
+
+    def _export_selected_results(self) -> None:
+        rows = {item.row() for item in self.table.selectedItems()}
+        if not rows:
+            QMessageBox.information(self, "DiskRecover", "Zaznacz plik na liście.")
+            return
+        paths = {
+            self.table.item(row, 0).text()
+            for row in rows
+            if self.table.item(row, 0)
+        }
+        self._export_live(paths=paths)
+
+    def _export_target_results(self) -> None:
+        self._export_live(categories={"target"})
+
+    def _export_live(self, *, paths=None, categories=None) -> None:
+        image = self.image_edit.text().strip()
+        out = self.out_edit.text().strip()
+        try:
+            engine = RecoveryEngine(image, out, target_name=self.target_edit.text().strip())
+            try:
+                session = engine.export_live_results(
+                    categories=categories, paths=set(paths) if paths else None
+                )
+            finally:
+                engine.close()
+            self._session = session
+            self._fill_results(session)
+            self.status.setText("Zakończono próbę odzyskiwania zapisanych wyników.")
+        except (OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "DiskRecover", f"Eksport nieudany:\n{exc}")
 
     def _open_output(self) -> None:
         path = self.out_edit.text().strip()
