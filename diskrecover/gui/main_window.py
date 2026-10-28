@@ -156,6 +156,12 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(
             [translated(text) for text in ["Ścieżka", "Wyjście", "Rozmiar", "Pewność", "Kategoria"]]
         )
+        self.progress.setFormat(
+            "Overall progress: %p%" if self._language == "en" else "Postęp całkowity: %p%"
+        )
+        self.stage_progress.setFormat(
+            "Current stage progress" if self._language == "en" else "Postęp bieżącego etapu"
+        )
         self.language_label.setText("Language:" if self._language == "en" else "Język:")
         self.language_combo.blockSignals(True)
         self.language_combo.setCurrentIndex(0 if self._language == "en" else 1)
