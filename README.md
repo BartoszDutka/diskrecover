@@ -53,7 +53,8 @@ rescanning the image.
 ### Safety and capabilities
 
 The information view summarizes the non-destructive design and current
-filesystem support.
+filesystem support. English is selected by default; the language selector
+also provides Polish and updates the visible interface immediately.
 
 ![Safety and capabilities](docs/screenshots/about.png)
 

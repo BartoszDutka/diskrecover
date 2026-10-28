@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -37,6 +38,7 @@ from diskrecover.core.checkpoint import ResultStore, default_checkpoint_dir
 from diskrecover.core.recovery import RecoveryEngine, RecoveryMode, available_checkpoints
 from diskrecover.gui.theme import DARK_QSS
 from diskrecover.gui.workers import AnalyzeWorker, RecoverWorker
+from diskrecover.i18n import UI_TRANSLATIONS
 
 class CheckpointPickerDialog(QDialog):
     def __init__(self, checkpoints: list[dict], parent=None) -> None:
@@ -81,7 +83,8 @@ class CheckpointPickerDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self, initial_image: str | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("DiskRecover — odzyskiwanie FAT32")
+        self._language = "en"
+        self.setWindowTitle("DiskRecover — FAT32 recovery")
         self.resize(1100, 760)
         self.setStyleSheet(DARK_QSS)
 
@@ -106,7 +109,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(brand)
         layout.addWidget(sub)
 
-        tabs = QTabWidget()
+        self.tabs = QTabWidget()
+        tabs = self.tabs
         layout.addWidget(tabs, 1)
 
         tabs.addTab(self._build_source_tab(), "1. Obraz i parametry")
@@ -120,7 +124,76 @@ class MainWindow(QMainWindow):
         if initial_image:
             self.image_edit.setText(initial_image)
 
+        self._retranslate_ui()
         self._refresh_resume_availability()
+
+    def _retranslate_ui(self) -> None:
+        """Apply the selected language to the currently visible UI."""
+        if self._language == "en":
+            translations = UI_TRANSLATIONS
+            title = "DiskRecover — FAT32 recovery"
+        else:
+            translations = {value: key for key, value in UI_TRANSLATIONS.items()}
+            title = "DiskRecover — odzyskiwanie FAT32"
+
+        def translated(text: str) -> str:
+            return translations.get(text, text)
+
+        self.setWindowTitle(title)
+        for widget in self.findChildren(QWidget):
+            if isinstance(widget, QAbstractButton):
+                widget.setText(translated(widget.text()))
+            elif isinstance(widget, QGroupBox):
+                widget.setTitle(translated(widget.title()))
+            elif isinstance(widget, QLabel):
+                widget.setText(translated(widget.text()))
+            elif isinstance(widget, QLineEdit):
+                widget.setPlaceholderText(translated(widget.placeholderText()))
+        for index in range(self.tabs.count()):
+            self.tabs.setTabText(index, translated(self.tabs.tabText(index)))
+        for index in range(self.mode_combo.count()):
+            self.mode_combo.setItemText(index, translated(self.mode_combo.itemText(index)))
+        self.table.setHorizontalHeaderLabels(
+            [translated(text) for text in ["Ścieżka", "Wyjście", "Rozmiar", "Pewność", "Kategoria"]]
+        )
+        self.language_label.setText("Language:" if self._language == "en" else "Język:")
+        self.language_combo.blockSignals(True)
+        self.language_combo.setCurrentIndex(0 if self._language == "en" else 1)
+        self.language_combo.blockSignals(False)
+        self.about_text.setHtml(self._about_html())
+
+    def _about_html(self) -> str:
+        if self._language == "en":
+            return """
+            <h2 style="color:#7dd3c0">DiskRecover</h2>
+            <p>Universal, non-destructive recovery from FAT32 disk images.</p>
+            <ul>
+              <li>Fully non-destructive — the image is never written</li>
+              <li>FAT parameters (BPB) validated from the image</li>
+              <li>Directory reconstruction, confidence levels, RAW carving</li>
+              <li>SQLite checkpoints: pause / resume / automatic saving</li>
+              <li>Separate confident, orphaned, RAW, and uncertain results</li>
+            </ul>
+            <p><b>Unsupported:</b> writing to the original media, in-place FAT repair,
+            filesystems other than FAT32, and mounting disk images.</p>
+            """
+        return """
+            <h2 style="color:#7dd3c0">DiskRecover</h2>
+            <p>Uniwersalne, nieniszczące odzyskiwanie danych z obrazów FAT32.</p>
+            <ul>
+              <li>Całkowicie nieniszcząca — obraz nigdy nie jest zapisywany</li>
+              <li>Parametry FAT (BPB) walidowane z obrazu</li>
+              <li>Rekonstrukcja katalogów, poziomy pewności, carving RAW</li>
+              <li>Checkpointy SQLite: pauza / wznowienie / auto-zapis</li>
+              <li>Rozdzielenie wyników pewnych, osieroconych, RAW i nieustalonych</li>
+            </ul>
+            <p><b>Nieobsługiwane:</b> zapis na oryginalny nośnik, naprawa tablic FAT
+            in-place, systemy plików inne niż FAT32 i montowanie obrazu.</p>
+            """
+
+    def _language_changed(self, index: int) -> None:
+        self._language = "en" if index == 0 else "pl"
+        self._retranslate_ui()
 
     def _build_source_tab(self) -> QWidget:
         w = QWidget()
@@ -343,24 +416,18 @@ class MainWindow(QMainWindow):
     def _build_about_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
-        t = QTextEdit()
-        t.setReadOnly(True)
-        t.setHtml(
-            """
-            <h2 style="color:#7dd3c0">DiskRecover</h2>
-            <p>Uniwersalne, nieniszczące odzyskiwanie danych z obrazów FAT32.</p>
-            <ul>
-              <li>Całkowicie nieniszcząca — obraz nigdy nie jest zapisywany</li>
-              <li>Parametry FAT (BPB) walidowane z obrazu, nie z notatek</li>
-              <li>Rekonstrukcja katalogów, poziomy pewności, carving RAW</li>
-              <li>Checkpointy SQLite: pauza / wznowienie / auto-zapis</li>
-              <li>Rozdzielenie wyników pewnych, osieroconych, RAW i nieustalonych</li>
-            </ul>
-            <p><b>Nieobsługiwane:</b> zapis na oryginalny nośnik, naprawa tablic FAT in-place,
-            systemy plików inne niż FAT32, montowanie obrazu.</p>
-            """
-        )
-        v.addWidget(t)
+        language_row = QHBoxLayout()
+        self.language_label = QLabel("Language:")
+        self.language_combo = QComboBox()
+        self.language_combo.addItems(["English", "Polski"])
+        self.language_combo.currentIndexChanged.connect(self._language_changed)
+        language_row.addWidget(self.language_label)
+        language_row.addWidget(self.language_combo)
+        language_row.addStretch()
+        v.addLayout(language_row)
+        self.about_text = QTextEdit()
+        self.about_text.setReadOnly(True)
+        v.addWidget(self.about_text)
         return w
 
     def _browse_image(self) -> None:
