@@ -1,4 +1,4 @@
-"""Rekonstrukcja uszkodzonych katalogów (np. „bhp szkoły”)."""
+"""Rekonstrukcja uszkodzonych katalogów."""
 
 from __future__ import annotations
 
@@ -446,7 +446,7 @@ def find_orphan_directories(
     candidate_clusters: Optional[List[int]] = None,
     tracker: Optional[ClusterTracker] = None,
     target_cluster: Optional[int] = None,
-    target_name: str = "bhp szkoły",
+    target_name: str = "",
     profiler: Optional[Profiler] = None,
     already_checked: Optional[Set[int]] = None,
     candidate_cb: Optional[Callable[[str, int, str, dict], None]] = None,
@@ -793,7 +793,7 @@ def diagnose_orphan_candidate(
     cluster: int,
     *,
     target_cluster: Optional[int] = None,
-    target_name: str = "bhp szkoły",
+    target_name: str = "",
     budget: Optional[CandidateBudget] = None,
 ) -> dict:
     """Analyze exactly one orphan candidate without scanning the volume."""
@@ -875,7 +875,7 @@ def diagnose_orphan_candidate(
 
 def reconstruct_target(
     vol: Fat32Volume,
-    target_name: str = "bhp szkoły",
+    target_name: str = "",
     *,
     progress_cb: ProgressCb = None,
     cancel_cb: CancelCb = None,

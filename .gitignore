@@ -7,3 +7,15 @@ build/
 *.spec.bak
 .venv/
 venv/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.bin
+*.img
+*.dd
+*.raw
+checkpoint*.json
+checkpoints/
+*.log
+exported/
+recovered/

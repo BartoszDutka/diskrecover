@@ -1,200 +1,71 @@
 # DiskRecover
 
-Bezpieczne odzyskiwanie danych z obrazów FAT32 — aplikacja desktopowa dla **Bartosza Dutki** (Windows 11, polski interfejs).
+DiskRecover is a non-destructive desktop and command-line toolkit for
+recovering files from disk images. The currently implemented filesystem
+reader is **FAT32**; other filesystems are intentionally reported as
+unsupported rather than guessed.
 
-Przeznaczona do rekonstrukcji uszkodzonego katalogu **`bhp szkoły`** z obrazu pendrive (np. `pendrive_bhp.bin`).
+## Features
 
-## Ważne zasady
+- Read-only image access (streaming reads or read-only memory mapping).
+- MBR partition discovery and BPB-derived FAT32 parameters.
+- Quick/full reconstruction, orphan analysis, RAW carving, and checkpoints.
+- Safe file validation for PDF, Office/OOXML, OLE/CFB, RTF, and ZIP containers.
+- Streaming SHA-256 deduplication with an optional SQLite hash cache.
+- Nondestructive export with conflict-safe names and an `export-map.csv`
+  provenance file.
+- JSON, CSV, and HTML recovery reports.
 
-- **Tylko odczyt** — obraz i tablice FAT **nigdy** nie są modyfikowane.
-- Parametry partycji/BPB (sektor, klaster, FAT, root) są **odczytywane i walidowane z obrazu**, nie z notatek.
-- Pliki bez pewnego pochodzenia → `Nieustalone_pochodzenie/`.
-- Wyniki RAW (carving po sygnaturach) **nigdy** nie są przypisywane do `bhp szkoły` bez dowodu.
-- Duże obrazy (~16 GB) są czytane strumieniowo (mmap / chunki) — bez ładowania całości do RAM.
+Validation distinguishes `VALID_STRUCTURE`, `PARTIALLY_RECOVERED`,
+`CORRUPTED`, `UNVERIFIED`, `ENCRYPTED`, and `DUPLICATE`. A valid structure
+does not guarantee that the document's contents are complete or readable.
+No recovered document is opened by an office application, and no macros or
+active content are executed.
 
-## Wymagania
+## Installation
 
-- Python 3.10+
-- Windows 11 (GUI) lub Linux (CLI + testy)
+Python 3.10 or newer is required.
 
-```bash
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Uruchomienie
+## Usage
 
-### GUI (domyślnie)
-
-```bash
-python -m diskrecover
-# lub
+```powershell
 python -m diskrecover gui
+python -m diskrecover analyze C:\path\image.bin
+python -m diskrecover recover C:\path\image.bin -o C:\path\output --no-raw
+python -m diskrecover validate C:\path\recovered --json
+python -m diskrecover export-validated C:\path\recovered -o C:\path\verified --flat
 ```
 
-### CLI — analiza BPB/MBR
+`--target` is optional and is only needed for targeted reconstruction.
+`--partition-lba` can override partition discovery when an image has damaged
+partition metadata. The source image is never modified.
 
-```bash
-python -m diskrecover analyze "C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive_bhp.bin"
-```
+## Supported and unsupported filesystems
 
-### CLI — pełne odzyskiwanie
+FAT32 is the only filesystem reader currently implemented. FAT12, FAT16,
+exFAT, NTFS, and ext2/ext3/ext4 are extension targets, not supported input
+formats today.
 
-```bash
-python -m diskrecover recover "C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive_bhp.bin" -o "D:\Odzysk_BHP" --target "bhp szkoły"
-```
+## Development
 
-Opcje: `--no-raw`, `--shallow`, `--partition-lba N`, `--json`.
-
-### CLI — odzyskiwanie wyłącznie `bhp szkoły`
-
-Tryb `TARGET_ONLY` kończy rekonstrukcję po zapisaniu obiektów powiązanych z
-katalogiem docelowym. Nie eksportuje innych wpisów katalogu głównego, osieroconych
-katalogów ani RAW:
-
-```bash
-python -m diskrecover recover "C:\ścieżka\obraz.bin" -o "D:\Odzysk_BHP" \
-  --mode TARGET_ONLY --target "bhp szkoły" --target-cluster 1843110 --no-raw
-```
-
-Tryb pełnego odzyskiwania pozostaje dostępny jawnie:
-
-```bash
-python -m diskrecover recover "C:\ścieżka\obraz.bin" -o "D:\Odzysk_BHP" \
-  --mode FULL_RECOVERY
-```
-
-Jeżeli `Raport/results.sqlite` już zawiera zapisane rekordy `target`, można je
-wyeksportować bez ponownego skanowania i bez modyfikacji obrazu:
-
-```bash
-python -m diskrecover export-target "C:\ścieżka\obraz.bin" \
-  -o "D:\Odzysk_BHP" --target "bhp szkoły"
-```
-
-Polecenie odczytuje wyłącznie istniejącą bazę wyników oraz potrzebne klastry
-obrazu w trybie read-only.
-
-### Diagnostyka pojedynczego kandydata
-
-Diagnostyka nie uruchamia pełnego skanowania. Wymaga konkretnego numeru
-klastra, najlepiej ustalonego z `Raport/results.sqlite`:
-
-```bash
-python -m diskrecover diagnose-candidate "C:\ścieżka\obraz.bin" \
-  --output "C:\ścieżka\wyniki" --cluster 1274390 --target-cluster 1843110
-```
-
-Wynik zawiera czas, status kandydata, liczniki odczytów, klastrów i rekordów,
-powtarzane klastry katalogów oraz profil `cProfile`.
-
-## Układ katalogu wyjściowego
-
-```
-Odtworzony_bhp_szkoly/     — pliki z dowodem przynależności do katalogu docelowego
-Osierocone_katalogi/       — katalogi wykryte lokalnie, bez linku z drzewa
-RAW/                       — carving po sygnaturach (PDF, Office, obrazy, media…)
-Nieustalone_pochodzenie/   — niepewna przynależność
-Raport/                    — raport.html, raport.json, raport.csv, checkpoint.json, profile.txt
-Raport/checkpoints/        — checkpointy SQLite (wznawialny stan skanowania)
-```
-
-## Checkpointy i wznawianie
-
-Zakładka **Skanowanie** zawiera:
-
-- **Zapisz postęp** — atomowy checkpoint SQLite bez zatrzymywania skanu
-- **Wstrzymaj / Wznów** — bezpieczne zatrzymanie workera
-- **Anuluj i zapisz** — checkpoint, potem przerwanie
-- **Wznów poprzednie skanowanie** — wybór zgodnego checkpointu (weryfikacja odcisku obrazu)
-- **Otwórz folder checkpointów**
-
-Auto-zapis: co N sekund (domyślnie 300), po etapach oraz po N kandydatch osieroconych.
-
-Po zakończeniu rekonstrukcji checkpoint zawiera także wersjonowany snapshot
-odnalezionych węzłów (nazwy, rozmiary, klastry, relacje, dowody i poziomy
-pewności). Zakładka **Wyniki** może wczytać ten snapshot bez wznawiania skanu;
-obiekty wczytane przed eksportem są wyraźnie oznaczone jako niewyeksportowane.
-Starsze checkpointy, które zawierają wyłącznie statystyki, nie są traktowane
-jak pełne wyniki i zgłaszają brak snapshotu.
-
-Podczas skanowania bieżące wyniki są dodatkowo zapisywane partiami do
-`Raport/results.sqlite` w trybie WAL. Baza zawiera pełne rekordy obiektów oraz
-kolejkę kandydatów (`PENDING`, `RUNNING`, `COMPLETED`, `DEFERRED`, `FAILED`),
-więc przycisk **Odśwież wyniki** działa także podczas pauzy lub skanowania.
-Kandydat przekraczający budżet czasu, odczytów, klastrów albo rekordów trafia
-do `DEFERRED` i nie jest oznaczany jako nieodzyskiwalny.
-
-Etap eksportu używa wspólnego zbioru odwiedzonych klastrów i stabilnych
-identyfikatorów wpisów katalogowych. Dzięki temu katalog główny nie powoduje
-ponownego rozwijania tych samych drzew. Pasek etapu pokazuje liczbę
-przetworzonych obiektów oraz aktualną nazwę, a odczyty FAT/klastrów są
-raportowane jako wartości absolutne, nie sumowane wielokrotnie przy każdym
-heartbeat.
-
-Osierocone podfoldery z wpisem `..` wskazującym klaster katalogu docelowego
-(np. `1843110` dla `bhp szkoły`) są oznaczane osobno i eksportowane do
-`Odtworzony_bhp_szkoly/` z poziomem pewności „wysokie”.
-
-## Testy
-
-Testy używają **syntetycznych obrazów FAT32** — nie potrzeba prawdziwego pendrive.
-
-```bash
+```powershell
 pytest -q
 ```
 
-### Diagnostyka długiego skanowania
+The core package is separated into image access, FAT32 parsing, reconstruction,
+carving, validation, deduplication, export, persistence, and reporting
+modules. The PySide6 GUI and CLI use the same core services.
 
-Podczas odzyskiwania aplikacja wykonuje rzeczywisty skan w workerze `QThread`.
-Zakładka „Skanowanie” pokazuje liczniki odczytów obrazu, klastrów, wpisów
-katalogowych i uszkodzeń FAT. Pasek etapu może pozostać nieokreślony, gdy
-liczby operacji nie da się wiarygodnie wyznaczyć — aplikacja nie udaje wtedy
-procentowego postępu.
+## Safety and limitations
 
-Po rozpoczęciu skanowania tworzony jest:
+Use a forensic copy whenever possible. Recovery cannot guarantee complete
+content when metadata or data clusters have been overwritten. Do not treat
+validation as proof of semantic correctness. Physical-device support and
+in-place filesystem repair are deliberately not provided.
 
-```text
-<katalog-wyjściowy>\Raport\scanner_debug.log
-```
-
-Log jest zapisywany na bieżąco. Brak heartbeat przez 30 sekund powoduje
-ostrzeżenie diagnostyczne, ale nie kończy ani nie oznacza automatycznie procesu
-jako zawieszonego. Łańcuchy FAT mają limit wynikający z liczby klastrów
-woluminu oraz zbiór odwiedzonych klastrów, więc cykliczne referencje są
-przerywane.
-
-Parser katalogów odrzuca rekordy z nieprawidłowymi atrybutami, klastrami poza
-zakresem, błędnymi rekordami LFN i niespójnymi wpisami `.`/`..`. Przypadkowy
-klaster nie jest uznawany za katalog tylko dlatego, że zawiera znaki
-przypominające rekordy 32-bajtowe. Panel skanowania pokazuje osobno rekordy
-sprawdzone, odrzucone, poprawne oraz kandydatów.
-
-## Budowa .exe (PyInstaller)
-
-Na Windows:
-
-```bash
-pip install pyinstaller
-python scripts/build_exe.py
-```
-
-## Kontekst problemu (domyślne wartości w UI)
-
-| Parametr | Przykład użytkownika | Uwaga |
-|----------|----------------------|--------|
-| Obraz | `C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive_bhp.bin` | ~15 560 867 840 B |
-| Sektor | 512 | Walidowane z BPB |
-| MBR / LBA | ~2904 | Odczyt z MBR; można nadpisać w UI |
-| Klaster | raportowano 8192 | **Zawsze z BPB obrazu** |
-| Cel | `bhp szkoły` | |
-
-## Nieobsługiwane
-
-- Zapis / naprawa FAT in-place na obrazie lub nośniku
-- Systemy plików inne niż FAT32
-- Montowanie obrazu jako dysku
-- Gwarancja 100% odzyskania przy całkowicie zniszczonych metadanych
-
-## Licencja / autor
-
-Narzędzie przygotowane na potrzeby odzyskania danych Bartosza Dutki.

@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -48,7 +49,6 @@ from diskrecover.core.telemetry import (
 
 
 OUTPUT_DIRS = (
-    "Odtworzony_bhp_szkoly",
     "Osierocone_katalogi",
     "RAW",
     "Nieustalone_pochodzenie",
@@ -175,7 +175,7 @@ class RecoveryEngine:
         image_path: str | Path,
         output_dir: str | Path,
         *,
-        target_name: str = "bhp szkoły",
+        target_name: str = "",
         partition_lba: Optional[int] = None,
         enable_raw: bool = True,
         deep_scan: bool = True,
@@ -349,16 +349,16 @@ class RecoveryEngine:
             "wysokie": sum(i.confidence == Confidence.HIGH.value for i in files),
             "srednie": sum(i.confidence == Confidence.MEDIUM.value for i in files),
             "niskie": sum(i.confidence == Confidence.LOW.value for i in files),
-            "podfoldery_bhp_szkoly": sum(
+            "target_subdirectories": sum(
                 i.is_directory and i.category == "target" for i in items
             ),
-            "pliki_w_podfolderach_bhp": sum(
+            "target_files_in_subdirectories": sum(
                 i.category == "target" for i in files
             ),
         }
         return RecoverySession(
             image_path="", output_dir=str(Path(path).parents[1]),
-            target_name="bhp szkoły", volume_summary={},
+            target_name="", volume_summary={},
             items=items, stats=stats,
             checkpoint_path=str(path),
         )
@@ -396,7 +396,38 @@ class RecoveryEngine:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         for d in OUTPUT_DIRS:
             (self.output_dir / d).mkdir(parents=True, exist_ok=True)
+        self._target_root().mkdir(parents=True, exist_ok=True)
         default_checkpoint_dir(self.output_dir).mkdir(parents=True, exist_ok=True)
+
+    def _target_root(self) -> Path:
+        if not self.target_name:
+            return self.output_dir / "Recovered"
+        normalized = unicodedata.normalize("NFKD", self.target_name)
+        normalized = normalized.translate(str.maketrans({"ł": "l", "Ł": "L"}))
+        slug = normalized.encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", slug).strip("._-") or "target"
+        return self.output_dir / f"Odtworzony_{slug[:160]}"
+
+    def _infer_target_name(self, vol: Fat32Volume) -> str:
+        """Choose a likely target directory when the user left it unspecified."""
+        try:
+            entries = read_directory(
+                vol, vol.bpb.root_cluster, include_deleted=False, tracker=self.tracker
+            )
+        except (OSError, ValueError, RuntimeError):
+            return ""
+        candidates = [
+            entry.name
+            for entry in entries
+            if entry.is_directory and not entry.is_dot and not entry.is_volume_label
+        ]
+        return candidates[0] if candidates else ""
+
+    def _orphan_root(self) -> Path:
+        return self.output_dir / "Osierocone_katalogi"
+
+    def _unknown_root(self) -> Path:
+        return self.output_dir / "Nieustalone_pochodzenie"
 
     def open_volume(self, progress_cb: ProgressCb = None) -> Fat32Volume:
         if progress_cb:
@@ -635,6 +666,8 @@ class RecoveryEngine:
         self._result_store.recover_incomplete_candidates()
         self.open_volume()
         assert self.volume is not None
+        if not self.target_name:
+            self.target_name = self._infer_target_name(self.volume)
         known_offsets: Set[int] = set()
         self._export_seen_objects: Set[tuple[str, int, bool]] = set()
         self._export_processed = 0
@@ -650,7 +683,7 @@ class RecoveryEngine:
         items = self._export_tree(
             self.volume,
             target_nodes + linked_nodes,
-            self.output_dir / "Odtworzony_bhp_szkoly",
+            self._target_root(),
             category="target",
             known_offsets=known_offsets,
         )
@@ -659,7 +692,7 @@ class RecoveryEngine:
                 self._export_tree(
                     self.volume,
                     [orphan],
-                    self.output_dir / "Osierocone_katalogi",
+                    self._orphan_root(),
                     category="orphan",
                     known_offsets=known_offsets,
                 )
@@ -718,9 +751,9 @@ class RecoveryEngine:
                     belongs_to_target=record["category"] == "target",
                 )
                 destination = (
-                    self.output_dir / "Odtworzony_bhp_szkoly"
+                    self._target_root()
                     if record["category"] == "target"
-                    else self.output_dir / "Nieustalone_pochodzenie"
+                    else self._unknown_root()
                 )
                 destination.mkdir(parents=True, exist_ok=True)
                 dest = destination / safe_filename(node.name)
@@ -912,6 +945,8 @@ class RecoveryEngine:
         self._scan_state["stage_index"] = 0
 
         vol = self.open_volume(progress_cb)
+        if not self.target_name:
+            self.target_name = self._infer_target_name(vol)
         vol.activity_cb = telemetry_event
         if self.telemetry:
             self.telemetry.update(
@@ -1063,7 +1098,7 @@ class RecoveryEngine:
             progress_cb(55, "Rekonstruuję znalezione pliki…")
         if self.telemetry:
             self.telemetry.update(stage="Rekonstrukcja znalezionych plików")
-        target_root = self.output_dir / "Odtworzony_bhp_szkoly"
+        target_root = self._target_root()
         items.extend(
             self._export_tree(
                 vol, recon.nodes, target_root, category="target", known_offsets=known_offsets
@@ -1072,7 +1107,7 @@ class RecoveryEngine:
 
         if progress_cb:
             progress_cb(62, "Eksportuję osierocone katalogi…")
-        orphan_root = self.output_dir / "Osierocone_katalogi"
+        orphan_root = self._orphan_root()
         if self.mode == RecoveryMode.FULL_RECOVERY:
             for orphan in recon.orphan_directories:
                 items.extend(
@@ -1102,7 +1137,7 @@ class RecoveryEngine:
 
         if not recon.target_found:
             recon.messages.append(
-                "Katalog docelowy nieznaleziony — nie przypisano plików do Odtworzony_bhp_szkoly."
+                "Katalog docelowy nie został znaleziony — pliki nie zostały do niego przypisane."
             )
         if recon.target_found and not recon.target_linked_orphans and not recon.target_directory_intact:
             recon.messages.append(
@@ -1221,7 +1256,7 @@ class RecoveryEngine:
         known_offsets: Set[int],
         progress_cb: ProgressCb = None,
     ) -> List[RecoveryItem]:
-        unknown_root = self.output_dir / "Nieustalone_pochodzenie"
+        unknown_root = self._unknown_root()
         items: List[RecoveryItem] = []
         try:
             root_entries = read_directory(
@@ -1327,7 +1362,7 @@ class RecoveryEngine:
         progress_cb: ProgressCb = None,
     ) -> List[RecoveryItem]:
         items: List[RecoveryItem] = []
-        unknown_base = self.output_dir / "Nieustalone_pochodzenie"
+        unknown_base = self._unknown_root()
 
         def export_node(node: RecoveredNode, parent_dir: Path) -> None:
             if self._cancelled():
@@ -1446,7 +1481,7 @@ class RecoveryEngine:
 
     def _stats(self, items: List[RecoveryItem], recon: ReconstructionResult) -> Dict[str, int]:
         files = [i for i in items if not i.is_directory]
-        return {
+        stats = {
             "plikow_lacznie": len(files),
             "katalogow": sum(1 for i in items if i.is_directory),
             "w_docelowym": sum(1 for i in files if i.category == "target"),
@@ -1458,12 +1493,16 @@ class RecoveryEngine:
             "niskie": sum(1 for i in files if i.confidence == Confidence.LOW.value),
             "target_znaleziony": 1 if recon.target_found else 0,
             "target_intact": 1 if recon.target_directory_intact else 0,
-            "podfoldery_bhp_szkoly": len(recon.target_linked_orphans),
-            "pliki_w_podfolderach_bhp": recon.stats.get("target_linked_files", 0),
+            "target_subdirectories": len(recon.target_linked_orphans),
+            "target_files_in_subdirectories": recon.stats.get("target_linked_files", 0),
             "unique_clusters": recon.stats.get("unique_clusters_analyzed", 0),
             "cluster_reads": recon.stats.get("cluster_reads", 0),
             "rereads": recon.stats.get("rereads", 0),
         }
+        # Keep names from the v1 results schema readable by older consumers.
+        stats["podfoldery_bhp_szkoly"] = stats["target_subdirectories"]
+        stats["pliki_w_podfolderach_bhp"] = stats["target_files_in_subdirectories"]
+        return stats
 
     def _save_legacy_checkpoint(self, session: RecoverySession, path: Path) -> None:
         data = {

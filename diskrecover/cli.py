@@ -11,10 +11,6 @@ from diskrecover import __version__
 from diskrecover.core.recovery import RecoveryMode
 
 
-DEFAULT_IMAGE = r"C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive_bhp.bin"
-DEFAULT_TARGET = "bhp szkoły"
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="diskrecover",
@@ -29,19 +25,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Analiza
     a = sub.add_parser("analyze", help="Pokaż parametry MBR/BPB z obrazu")
-    a.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
+    a.add_argument("image")
     a.add_argument("--partition-lba", type=int, default=None)
 
     # Odzyskiwanie
     r = sub.add_parser("recover", help="Pełne odzyskiwanie do katalogu wyjściowego")
-    r.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
+    r.add_argument("image")
     r.add_argument("-o", "--output", required=True, help="Katalog wyjściowy")
-    r.add_argument("--target", default=DEFAULT_TARGET, help="Nazwa katalogu docelowego")
+    r.add_argument("--target", default="", help="Nazwa katalogu docelowego (opcjonalna)")
     r.add_argument(
         "--target-cluster",
         type=int,
         default=None,
-        help="Znany klaster nadrzędny katalogu docelowego, np. 1843110",
+        help="Znany klaster nadrzędny katalogu docelowego",
     )
     r.add_argument("--partition-lba", type=int, default=None)
     r.add_argument("--no-raw", action="store_true", help="Wyłącz carving RAW")
@@ -58,24 +54,37 @@ def build_parser() -> argparse.ArgumentParser:
         "export-target",
         help="Eksportuj już zapisane rekordy target z results.sqlite bez skanowania",
     )
-    e.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
+    e.add_argument("image")
     e.add_argument("-o", "--output", required=True, help="Katalog wyników z Raport/results.sqlite")
-    e.add_argument("--target", default=DEFAULT_TARGET)
+    e.add_argument("--target", default="")
 
     d = sub.add_parser(
         "diagnose-candidate",
         help="Zdiagnozuj jeden kandydat osieroconego katalogu bez pełnego skanu",
     )
-    d.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
+    d.add_argument("image")
     d.add_argument("--output", required=True, help="Katalog wyników/logów")
     d.add_argument("--cluster", type=int, required=True)
-    d.add_argument("--target", default=DEFAULT_TARGET)
+    d.add_argument("--target", default="")
     d.add_argument("--target-cluster", type=int, default=None)
     d.add_argument("--partition-lba", type=int, default=None)
     d.add_argument("--max-seconds", type=float, default=300.0)
     d.add_argument("--max-reads", type=int, default=100_000)
     d.add_argument("--max-clusters", type=int, default=100_000)
     d.add_argument("--max-records", type=int, default=1_000_000)
+
+    v = sub.add_parser("validate", help="Sprawdź strukturę odzyskanych plików")
+    v.add_argument("source", help="Plik lub katalog do sprawdzenia")
+    v.add_argument("--json", action="store_true", help="Wynik JSON na stdout")
+    v.add_argument("--cache", help="Opcjonalna baza cache SHA-256")
+
+    x = sub.add_parser("export-validated", help="Eksportuj pliki po walidacji")
+    x.add_argument("source", help="Plik lub katalog źródłowy")
+    x.add_argument("-o", "--output", required=True, help="Katalog docelowy")
+    x.add_argument("--flat", action="store_true", help="Jeden katalog bez struktury źródła")
+    x.add_argument("--include-unverified", action="store_true")
+    x.add_argument("--keep-duplicates", action="store_true")
+    x.add_argument("--cache", help="Opcjonalna baza cache SHA-256")
 
     return p
 
@@ -210,6 +219,56 @@ def cmd_diagnose_candidate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+    from diskrecover.core.validation import validate_tree
+
+    try:
+        results = validate_tree(args.source)
+    except (OSError, ValueError) as exc:
+        print(f"Błąd walidacji: {exc}", file=sys.stderr)
+        return 1
+    payload = [
+        {
+            **asdict(result),
+            "path": str(result.path),
+            "duplicate_of": str(result.duplicate_of) if result.duplicate_of else None,
+            "integrity": result.integrity.value,
+            "status": result.status.value,
+        }
+        for result in results
+    ]
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        for result in payload:
+            print(f"{result['status']}: {result['path']} — {result['reason']}")
+        print(f"Sprawdzono plików: {len(payload)}")
+    return 0
+
+
+def cmd_export_validated(args: argparse.Namespace) -> int:
+    from diskrecover.core.export import export_files
+    from diskrecover.core.validation import validate_tree
+
+    try:
+        results = validate_tree(args.source)
+        records = export_files(
+            results,
+            args.output,
+            flatten=args.flat,
+            include_unverified=args.include_unverified,
+            skip_duplicates=not args.keep_duplicates,
+            source_root=args.source,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Błąd eksportu: {exc}", file=sys.stderr)
+        return 1
+    exported = sum(record.status == "EXPORTED" for record in records)
+    print(f"Wyeksportowano: {exported}; mapowanie: {Path(args.output) / 'export-map.csv'}")
+    return 0
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     from diskrecover.gui.app import run_gui
 
@@ -232,6 +291,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_export_target(args)
     if args.cmd == "diagnose-candidate":
         return cmd_diagnose_candidate(args)
+    if args.cmd == "validate":
+        return cmd_validate(args)
+    if args.cmd == "export-validated":
+        return cmd_export_validated(args)
     parser.print_help()
     return 1
 

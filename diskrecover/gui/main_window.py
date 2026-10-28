@@ -38,10 +38,6 @@ from diskrecover.core.recovery import RecoveryEngine, RecoveryMode, available_ch
 from diskrecover.gui.theme import DARK_QSS
 from diskrecover.gui.workers import AnalyzeWorker, RecoverWorker
 
-DEFAULT_IMAGE = r"C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive_bhp.bin"
-DEFAULT_TARGET = "bhp szkoły"
-
-
 class CheckpointPickerDialog(QDialog):
     def __init__(self, checkpoints: list[dict], parent=None) -> None:
         super().__init__(parent)
@@ -123,8 +119,6 @@ class MainWindow(QMainWindow):
 
         if initial_image:
             self.image_edit.setText(initial_image)
-        else:
-            self.image_edit.setText(DEFAULT_IMAGE)
 
         self._refresh_resume_availability()
 
@@ -132,7 +126,7 @@ class MainWindow(QMainWindow):
         w = QWidget()
         v = QVBoxLayout(w)
 
-        box = QGroupBox("Plik obrazu pendrive")
+        box = QGroupBox("Plik obrazu dysku")
         form = QFormLayout(box)
         row = QHBoxLayout()
         self.image_edit = QLineEdit()
@@ -151,7 +145,8 @@ class MainWindow(QMainWindow):
         out_row.addWidget(out_browse)
         form.addRow("Katalog wyjściowy:", out_row)
 
-        self.target_edit = QLineEdit(DEFAULT_TARGET)
+        self.target_edit = QLineEdit()
+        self.target_edit.setPlaceholderText("Opcjonalnie: nazwa katalogu docelowego")
         form.addRow("Katalog docelowy:", self.target_edit)
 
         self.lba_spin = QSpinBox()
@@ -185,7 +180,7 @@ class MainWindow(QMainWindow):
         ov.addWidget(self.chk_deep)
         self.mode_combo = QComboBox()
         self.mode_combo.addItem(
-            "TARGET_ONLY — tylko bhp szkoły",
+            "TARGET_ONLY — tylko wskazany katalog",
             RecoveryMode.TARGET_ONLY.value,
         )
         self.mode_combo.addItem(
@@ -196,7 +191,7 @@ class MainWindow(QMainWindow):
         ov.addWidget(self.mode_combo)
         note = QLabel(
             "Pliki RAW trafiają wyłącznie do folderu RAW/ i nigdy nie są przypisywane "
-            "do „bhp szkoły” bez dowodu. Niepewne → Nieustalone_pochodzenie/."
+            "do wskazanego katalogu bez dowodu."
         )
         note.setWordWrap(True)
         note.setObjectName("Subtitle")
@@ -329,7 +324,7 @@ class MainWindow(QMainWindow):
         load_btn.clicked.connect(self._load_checkpoint_results)
         export_selected_btn = QPushButton("Odzyskaj zaznaczone")
         export_selected_btn.clicked.connect(self._export_selected_results)
-        export_target_btn = QPushButton("Odzyskaj powiązane z bhp szkoły")
+        export_target_btn = QPushButton("Odzyskaj powiązane z katalogiem docelowym")
         export_target_btn.clicked.connect(self._export_target_results)
         open_btn = QPushButton("Otwórz katalog wyjściowy")
         open_btn.clicked.connect(self._open_output)
@@ -353,15 +348,13 @@ class MainWindow(QMainWindow):
         t.setHtml(
             """
             <h2 style="color:#7dd3c0">DiskRecover</h2>
-            <p>Aplikacja dla Bartosza Dutki — odzyskiwanie uszkodzonego katalogu
-            <b>bhp szkoły</b> z obrazu pendrive FAT32 (Windows 11).</p>
+            <p>Uniwersalne, nieniszczące odzyskiwanie danych z obrazów FAT32.</p>
             <ul>
               <li>Całkowicie nieniszcząca — obraz nigdy nie jest zapisywany</li>
               <li>Parametry FAT (BPB) walidowane z obrazu, nie z notatek</li>
               <li>Rekonstrukcja katalogów, poziomy pewności, carving RAW</li>
               <li>Checkpointy SQLite: pauza / wznowienie / auto-zapis</li>
-              <li>Układ wyjścia: Odtworzony_bhp_szkoly/, Osierocone_katalogi/,
-                  RAW/, Nieustalone_pochodzenie/, Raport/</li>
+              <li>Rozdzielenie wyników pewnych, osieroconych, RAW i nieustalonych</li>
             </ul>
             <p><b>Nieobsługiwane:</b> zapis na oryginalny nośnik, naprawa tablic FAT in-place,
             systemy plików inne niż FAT32, montowanie obrazu.</p>
@@ -463,7 +456,7 @@ class MainWindow(QMainWindow):
         self._recover_worker = RecoverWorker(
             image,
             out,
-            self.target_edit.text().strip() or DEFAULT_TARGET,
+            self.target_edit.text().strip(),
             self._partition_lba(),
             self.chk_raw.isChecked(),
             self.chk_deep.isChecked(),
@@ -555,7 +548,7 @@ class MainWindow(QMainWindow):
             self,
             "DiskRecover",
             f"Gotowe.\nPliki: {session.stats.get('plikow_lacznie', 0)}\n"
-            f"Podfoldery „bhp szkoły”: {session.stats.get('podfoldery_bhp_szkoly', 0)}\n"
+            f"Podfoldery powiązane z celem: {session.stats.get('target_subdirectories', 0)}\n"
             f"Raport: {session.output_dir}/Raport/",
         )
 
@@ -637,7 +630,7 @@ class MainWindow(QMainWindow):
             f"Poprawne wpisy: {snapshot.valid_entries:,}\n"
             f"Potwierdzone katalogi: {snapshot.confirmed_directories:,} | "
             f"Potwierdzone pliki: {snapshot.confirmed_files:,}\n"
-            f"Podfoldery powiązane z bhp szkoły: {snapshot.target_linked_subdirs:,} | "
+            f"Podfoldery powiązane z celem: {snapshot.target_linked_subdirs:,} | "
             f"Pliki w potwierdzonych podfolderach: {snapshot.target_linked_files:,}\n"
             f"Unikalne obiekty: {snapshot.unique_objects:,} | "
             f"Uszkodzenia: {snapshot.corruptions:,}\n"
@@ -689,8 +682,8 @@ class MainWindow(QMainWindow):
             f"Osierocone: {s.get('osierocone',0)} | "
             f"Nieustalone: {s.get('nieustalone',0)} | "
             f"RAW: {s.get('raw',0)} | "
-            f"Podfoldery bhp szkoły: {s.get('podfoldery_bhp_szkoly',0)} | "
-            f"Pliki w podfolderach: {s.get('pliki_w_podfolderach_bhp',0)} | "
+            f"Podfoldery celu: {s.get('target_subdirectories',0)} | "
+            f"Pliki w podfolderach: {s.get('target_files_in_subdirectories',0)} | "
             f"Pewność ↑ {s.get('wysokie',0)} / ↔ {s.get('srednie',0)} / ↓ {s.get('niskie',0)}"
         )
         files = [i for i in session.items if not i.is_directory]

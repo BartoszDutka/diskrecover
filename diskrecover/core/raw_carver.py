@@ -25,7 +25,7 @@ class CarvedFile:
     category: str
     output_name: str
     evidence: List[str] = field(default_factory=list)
-    # Zawsze False — RAW nigdy nie należy do bhp szkoły bez dowodu
+    # Zawsze False — RAW nie należy do katalogu docelowego bez dowodu.
     belongs_to_target: bool = False
 
 

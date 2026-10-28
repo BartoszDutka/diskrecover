@@ -6,5 +6,5 @@ TR = {
     "analyze": "Analizuj obraz",
     "start": "Start odzyskiwania",
     "cancel": "Anuluj",
-    "target_default": "bhp szkoły",
+    "target_default": "",
 }
