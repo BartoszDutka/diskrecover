@@ -45,6 +45,19 @@ python -m diskrecover recover "C:\Users\bdutka\Desktop\Odzyskiwanie_BHP\pendrive
 
 Opcje: `--no-raw`, `--shallow`, `--partition-lba N`, `--json`.
 
+### Diagnostyka pojedynczego kandydata
+
+Diagnostyka nie uruchamia pełnego skanowania. Wymaga konkretnego numeru
+klastra, najlepiej ustalonego z `Raport/results.sqlite`:
+
+```bash
+python -m diskrecover diagnose-candidate "C:\ścieżka\obraz.bin" \
+  --output "C:\ścieżka\wyniki" --cluster 1274390 --target-cluster 1843110
+```
+
+Wynik zawiera czas, status kandydata, liczniki odczytów, klastrów i rekordów,
+powtarzane klastry katalogów oraz profil `cProfile`.
+
 ## Układ katalogu wyjściowego
 
 ```

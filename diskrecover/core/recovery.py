@@ -35,6 +35,7 @@ from diskrecover.core.reconstruction import (
     flatten_nodes,
     reconstruct_target,
     CandidateBudget,
+    diagnose_orphan_candidate,
 )
 from diskrecover.core.report import write_reports
 from diskrecover.core.telemetry import (
@@ -175,10 +176,10 @@ class RecoveryEngine:
         checkpoint_interval_sec: float = 300.0,
         checkpoint_every_candidates: int = 500,
         resume_checkpoint: Optional[str | Path] = None,
-        candidate_max_seconds: float = 300.0,
-        candidate_max_reads: int = 100_000,
-        candidate_max_clusters: int = 100_000,
-        candidate_max_records: int = 1_000_000,
+        candidate_max_seconds: float = 60.0,
+        candidate_max_reads: int = 50_000,
+        candidate_max_clusters: int = 50_000,
+        candidate_max_records: int = 250_000,
         retry_deferred: bool = False,
     ) -> None:
         self.image_path = Path(image_path)
@@ -229,6 +230,26 @@ class RecoveryEngine:
 
     def results_path(self) -> Path:
         return self.output_dir / "Raport" / "results.sqlite"
+
+    def diagnose_candidate(
+        self,
+        cluster: int,
+        *,
+        target_cluster: Optional[int] = None,
+        budget: Optional[CandidateBudget] = None,
+    ) -> dict:
+        """Diagnose one candidate after opening the image, without a full scan."""
+        self._prepare_output()
+        self.open_volume()
+        assert self.volume is not None
+        self.volume.preload_fat()
+        return diagnose_orphan_candidate(
+            self.volume,
+            cluster,
+            target_cluster=target_cluster,
+            target_name=self.target_name,
+            budget=budget,
+        )
 
     def _ensure_result_store(self) -> ResultStore:
         if self._result_store is None:
@@ -592,6 +613,7 @@ class RecoveryEngine:
             self.output_dir = Path(output_dir)
         self._prepare_output()
         self._ensure_result_store()
+        self._result_store.recover_incomplete_candidates()
         self.open_volume()
         assert self.volume is not None
         known_offsets: Set[int] = set()
@@ -786,6 +808,8 @@ class RecoveryEngine:
         self._pause.set()
         self._checkpoint_cb = checkpoint_cb
         self._prepare_output()
+        self._ensure_result_store()
+        self._result_store.recover_incomplete_candidates()
         self.logger = create_scanner_logger(self.output_dir)
         self.telemetry = ScanTelemetry(
             self.image_path.stat().st_size if self.image_path.is_file() else 0,

@@ -41,6 +41,21 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--shallow", action="store_true", help="Bez głębokiego skanu klastrów")
     r.add_argument("--json", action="store_true", help="Podsumowanie JSON na stdout")
 
+    d = sub.add_parser(
+        "diagnose-candidate",
+        help="Zdiagnozuj jeden kandydat osieroconego katalogu bez pełnego skanu",
+    )
+    d.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
+    d.add_argument("--output", required=True, help="Katalog wyników/logów")
+    d.add_argument("--cluster", type=int, required=True)
+    d.add_argument("--target", default=DEFAULT_TARGET)
+    d.add_argument("--target-cluster", type=int, default=None)
+    d.add_argument("--partition-lba", type=int, default=None)
+    d.add_argument("--max-seconds", type=float, default=300.0)
+    d.add_argument("--max-reads", type=int, default=100_000)
+    d.add_argument("--max-clusters", type=int, default=100_000)
+    d.add_argument("--max-records", type=int, default=1_000_000)
+
     return p
 
 
@@ -113,6 +128,46 @@ def cmd_recover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_diagnose_candidate(args: argparse.Namespace) -> int:
+    from diskrecover.core.reconstruction import CandidateBudget
+    from diskrecover.core.recovery import RecoveryEngine
+
+    path = Path(args.image)
+    if not path.is_file():
+        print(f"Błąd: nie znaleziono obrazu: {path}", file=sys.stderr)
+        return 2
+    engine = RecoveryEngine(
+        path,
+        args.output,
+        target_name=args.target,
+        partition_lba=args.partition_lba,
+        enable_raw=False,
+        deep_scan=False,
+        candidate_max_seconds=args.max_seconds,
+        candidate_max_reads=args.max_reads,
+        candidate_max_clusters=args.max_clusters,
+        candidate_max_records=args.max_records,
+    )
+    try:
+        result = engine.diagnose_candidate(
+            args.cluster,
+            target_cluster=args.target_cluster,
+            budget=CandidateBudget(
+                max_seconds=args.max_seconds,
+                max_reads=args.max_reads,
+                max_clusters=args.max_clusters,
+                max_records=args.max_records,
+            ),
+        )
+    except Exception as exc:
+        print(f"Błąd diagnostyki: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.close()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_gui(args: argparse.Namespace) -> int:
     from diskrecover.gui.app import run_gui
 
@@ -131,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_analyze(args)
     if args.cmd == "recover":
         return cmd_recover(args)
+    if args.cmd == "diagnose-candidate":
+        return cmd_diagnose_candidate(args)
     parser.print_help()
     return 1
 

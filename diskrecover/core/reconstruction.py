@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import cProfile
+import io
+import pstats
 import time
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -89,6 +92,10 @@ class CandidateBudget:
             raise CandidateDeferred("cluster budget exceeded")
         if self.records > self.max_records:
             raise CandidateDeferred("record budget exceeded")
+
+    def consume_cluster(self) -> None:
+        self.clusters += 1
+        self.check()
 
 
 class CandidateDeferred(RuntimeError):
@@ -314,8 +321,7 @@ def build_tree_from_directory(
         return []
     visited.add(start_cluster)
     if budget:
-        budget.clusters += 1
-        budget.check()
+        budget.consume_cluster()
     nodes: List[RecoveredNode] = []
     try:
         entries = read_directory(
@@ -344,7 +350,7 @@ def build_tree_from_directory(
         if e.is_deleted:
             conf = Confidence.MEDIUM
             evidence.append("wpis oznaczony jako usunięty (0xE5)")
-        chain = vol.follow_chain(e.cluster) if e.cluster >= 2 else []
+        chain = _follow_cached_chain(vol, e.cluster, tracker, budget)
         if e.cluster >= 2 and not chain:
             conf = Confidence.MEDIUM
             evidence.append("brak łańcucha FAT — odczyt pojedynczego klastra")
@@ -406,6 +412,27 @@ def _count_files(nodes: List[RecoveredNode]) -> int:
         else:
             n += 1
     return n
+
+
+def _follow_cached_chain(
+    vol: Fat32Volume,
+    cluster: int,
+    tracker: Optional[ClusterTracker],
+    budget: Optional[CandidateBudget],
+) -> List[int]:
+    if cluster < 2:
+        return []
+    if tracker is not None:
+        cached = tracker.get_chain(cluster)
+        if cached is not None:
+            return list(cached)
+    chain = vol.follow_chain(
+        cluster,
+        check_cb=budget.consume_cluster if budget else None,
+    )
+    if tracker is not None:
+        tracker.put_chain(cluster, chain)
+    return chain
 
 
 def find_orphan_directories(
@@ -581,9 +608,20 @@ def find_orphan_directories(
             _telem(orphan_candidates_checked=1, orphan_candidates_rejected=1)
             continue
 
-        with profiler.span("orphan_follow_chain"):
-            tracker.fat_chains_checked += 1
-            chain = vol.follow_chain(c)
+        try:
+            with profiler.span("orphan_follow_chain"):
+                tracker.fat_chains_checked += 1
+                chain = _follow_cached_chain(vol, c, tracker, budget)
+        except CandidateDeferred as exc:
+            if candidate_cb:
+                candidate_cb(candidate_id, c, "DEFERRED", {
+                    "sequence_no": i, "reason": str(exc),
+                    "finished_at": time.time(),
+                    "reads": budget.reads if budget else 0,
+                    "clusters": budget.clusters if budget else 0,
+                    "records": budget.records if budget else 0,
+                })
+            continue
         if not chain or chain[0] != c:
             checked += 1
             rejected += 1
@@ -748,6 +786,91 @@ def find_orphan_directories(
             f"{linked_dirs} powiązanych z „{target_name}”",
         )
     return orphans, linked
+
+
+def diagnose_orphan_candidate(
+    vol: Fat32Volume,
+    cluster: int,
+    *,
+    target_cluster: Optional[int] = None,
+    target_name: str = "bhp szkoły",
+    budget: Optional[CandidateBudget] = None,
+) -> dict:
+    """Analyze exactly one orphan candidate without scanning the volume."""
+    tracker = ClusterTracker()
+    profiler = Profiler(enabled=True)
+    active_budget = budget or CandidateBudget()
+    events: List[dict] = []
+    seen_nodes: List[tuple[int, bool]] = []
+    started = time.monotonic()
+
+    def candidate_cb(candidate_id: str, candidate_cluster: int, status: str, data: dict) -> None:
+        events.append({
+            "candidate_id": candidate_id,
+            "cluster": candidate_cluster,
+            "status": status,
+            **data,
+        })
+
+    def node_cb(node: RecoveredNode) -> None:
+        if node.is_directory:
+            seen_nodes.append((node.cluster, True))
+
+    profile = cProfile.Profile()
+    profile.enable()
+    try:
+        orphan, linked = find_orphan_directories(
+            vol,
+            set(),
+            candidate_clusters=[cluster],
+            target_cluster=target_cluster,
+            target_name=target_name,
+            tracker=tracker,
+            profiler=profiler,
+            candidate_cb=candidate_cb,
+            node_cb=node_cb,
+            budget_factory=lambda: active_budget,
+        )
+    finally:
+        profile.disable()
+
+    stream = io.StringIO()
+    stats = pstats.Stats(profile, stream=stream).sort_stats("cumulative")
+    stats.print_stats(30)
+    repeated = sorted(
+        cluster_id
+        for cluster_id, _ in set(seen_nodes)
+        if seen_nodes.count((cluster_id, True)) > 1
+    )
+    return {
+        "cluster": cluster,
+        "elapsed_seconds": time.monotonic() - started,
+        "events": events,
+        "function_profile": stream.getvalue(),
+        "profiler": profiler.as_dict(),
+        "unique_clusters": tracker.unique_clusters_analyzed,
+        "cluster_reads": tracker.total_cluster_reads,
+        "rereads": tracker.reread_count,
+        "records": active_budget.records,
+        "budget": {
+            "reads": active_budget.reads,
+            "clusters": active_budget.clusters,
+            "records": active_budget.records,
+            "max_seconds": active_budget.max_seconds,
+            "max_reads": active_budget.max_reads,
+            "max_clusters": active_budget.max_clusters,
+            "max_records": active_budget.max_records,
+        },
+        "recursive_depth": max(
+            (len(node.path.split("/")) for node in linked + orphan),
+            default=0,
+        ),
+        "repeated_directory_clusters": repeated,
+        "result": {
+            "orphan": len(orphan),
+            "linked": len(linked),
+        },
+    }
 
 
 def reconstruct_target(

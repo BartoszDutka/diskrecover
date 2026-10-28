@@ -38,6 +38,7 @@ class ClusterTracker:
     chain_members: Set[int] = field(default_factory=set)
     uncertain: Set[int] = field(default_factory=set)
     dir_cache: Dict[int, DirectoryCacheEntry] = field(default_factory=dict)
+    chain_cache: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
     # liczniki rzeczywistych operacji
     unique_clusters_analyzed: int = 0
     total_cluster_reads: int = 0
@@ -103,6 +104,16 @@ class ClusterTracker:
         self.dir_cache[entry.start_cluster] = entry
         self.mark_chain(entry.start_cluster, entry.chain)
 
+    def get_chain(self, start_cluster: int) -> Optional[Tuple[int, ...]]:
+        return self.chain_cache.get(start_cluster)
+
+    def put_chain(self, start_cluster: int, chain: Iterable[int]) -> Tuple[int, ...]:
+        value = tuple(chain)
+        if value:
+            self.chain_cache[start_cluster] = value
+            self.mark_chain(start_cluster, value)
+        return value
+
     def export_state(self) -> dict:
         return {
             "analyzed_starts": sorted(self.analyzed_starts),
@@ -117,6 +128,7 @@ class ClusterTracker:
             "cache_misses": self.cache_misses,
             "cycles_detected": self.cycles_detected,
             "cached_dirs": sorted(self.dir_cache.keys()),
+            "cached_chains": sorted(self.chain_cache.keys()),
         }
 
     def import_state(self, data: dict) -> None:

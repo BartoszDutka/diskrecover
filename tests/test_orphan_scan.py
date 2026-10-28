@@ -8,6 +8,7 @@ from diskrecover.core.fat32 import Fat32Volume
 from diskrecover.core.image import ImageReader
 from diskrecover.core.reconstruction import (
     CandidateBudget,
+    diagnose_orphan_candidate,
     find_orphan_directories,
     flatten_nodes,
     reconstruct_target,
@@ -137,3 +138,15 @@ def test_expensive_candidate_is_deferred_and_retryable(fat32_image):
         )
         assert linked
         assert any(event[2] == "COMPLETED" for event in events)
+
+
+def test_single_candidate_diagnostic_does_not_scan_volume(fat32_image):
+    with ImageReader(fat32_image["path"]) as reader:
+        vol = Fat32Volume.open(reader, fat32_image["partition_offset"])
+        result = diagnose_orphan_candidate(
+            vol, 11, target_cluster=3, budget=CandidateBudget(max_records=0)
+        )
+        assert result["cluster"] == 11
+        assert result["events"]
+        assert any(e["status"] == "DEFERRED" for e in result["events"])
+        assert "function_profile" in result

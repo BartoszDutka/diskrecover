@@ -264,12 +264,19 @@ class Fat32Volume:
                 progress_cb(min(100, int(100 * loaded / bytes_needed)))
         self._fat_loaded = True
 
-    def follow_chain(self, start: int, max_clusters: Optional[int] = None) -> List[int]:
+    def follow_chain(
+        self,
+        start: int,
+        max_clusters: Optional[int] = None,
+        check_cb: Optional[Callable[[], None]] = None,
+    ) -> List[int]:
         chain: List[int] = []
         seen = set()
         c = start
         limit = max_clusters if max_clusters is not None else self.total_clusters + 2
         while c >= 2 and c < EOC_MIN and c != BAD_CLUSTER:
+            if check_cb:
+                check_cb()
             if c in seen:
                 if self.activity_cb:
                     self.activity_cb(corruptions=1, operation=f"Cykl FAT przy klastrze {c}")

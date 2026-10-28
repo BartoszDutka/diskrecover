@@ -567,6 +567,22 @@ class ResultStore:
                 for r in self._execute(sql, args).fetchall()
             ]
 
+    def recover_incomplete_candidates(self) -> int:
+        """Make a crashed RUNNING candidate explicitly retryable."""
+        with self._lock:
+            cursor = self._execute(
+                """
+                UPDATE candidate_queue
+                SET status='DEFERRED',
+                    reason=CASE WHEN reason='' THEN 'przerwane przed zamknięciem procesu'
+                               ELSE reason END,
+                    updated_at=?
+                WHERE status='RUNNING'
+                """,
+                (time.time(),),
+            )
+            return cursor.rowcount
+
     def mark_exported(self, object_id: str) -> None:
         with self._lock:
             self._execute(

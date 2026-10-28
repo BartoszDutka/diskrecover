@@ -266,3 +266,18 @@ def test_live_results_and_candidate_queue_are_durable(fat32_image, tmp_path):
     assert live.items
     assert live.stats["plikow_lacznie"] > 0
     assert live.stats["w_docelowym"] > 0
+
+
+def test_running_candidate_is_recoverable_after_restart(tmp_path):
+    store = ResultStore(tmp_path / "results.sqlite")
+    store.open()
+    try:
+        store.upsert_candidate(
+            "cluster:2352", 123, 2351, "RUNNING", started_at=1.0
+        )
+        assert store.recover_incomplete_candidates() == 1
+        candidates = store.list_candidates()
+    finally:
+        store.close()
+    assert candidates[0]["status"] == "DEFERRED"
+    assert "przerwane" in candidates[0]["reason"]
