@@ -299,10 +299,29 @@ class RecoveryEngine:
             )
             for o in objects
         ]
+        files = [item for item in items if not item.is_directory]
+        stats = {
+            "zapisane_obiekty": len(items),
+            "plikow_lacznie": len(files),
+            "katalogow": len(items) - len(files),
+            "w_docelowym": sum(i.category == "target" for i in files),
+            "osierocone": sum(i.category == "orphan" for i in files),
+            "nieustalone": sum(i.category == "unknown" for i in files),
+            "raw": sum(i.category == "raw" for i in files),
+            "wysokie": sum(i.confidence == Confidence.HIGH.value for i in files),
+            "srednie": sum(i.confidence == Confidence.MEDIUM.value for i in files),
+            "niskie": sum(i.confidence == Confidence.LOW.value for i in files),
+            "podfoldery_bhp_szkoly": sum(
+                i.is_directory and i.category == "target" for i in items
+            ),
+            "pliki_w_podfolderach_bhp": sum(
+                i.category == "target" for i in files
+            ),
+        }
         return RecoverySession(
             image_path="", output_dir=str(Path(path).parents[1]),
             target_name="bhp szkoły", volume_summary={},
-            items=items, stats={"zapisane_obiekty": len(items)},
+            items=items, stats=stats,
             checkpoint_path=str(path),
         )
 
@@ -576,6 +595,17 @@ class RecoveryEngine:
         self.open_volume()
         assert self.volume is not None
         known_offsets: Set[int] = set()
+        self._export_seen_objects: Set[tuple[str, int, bool]] = set()
+        self._export_processed = 0
+        self._export_total = max(
+            1,
+            sum(
+                1
+                for n in flatten_nodes(
+                    target_nodes + linked_nodes + orphan_nodes
+                )
+            ),
+        )
         items = self._export_tree(
             self.volume,
             target_nodes + linked_nodes,
@@ -972,6 +1002,11 @@ class RecoveryEngine:
 
         items: List[RecoveryItem] = []
         known_offsets: Set[int] = set()
+        self._export_seen_objects = set()
+        self._export_processed = 0
+        self._export_total = max(
+            1, len(flatten_nodes(recon.nodes + recon.orphan_directories))
+        )
 
         if progress_cb:
             progress_cb(55, "Rekonstruuję znalezione pliki…")
@@ -1003,9 +1038,10 @@ class RecoveryEngine:
             progress_cb(66, "Eksportuję pozostałe wpisy z katalogu głównego…")
         items.extend(
             self._export_other_root_entries(
-                vol, recon, known_offsets=known_offsets
+                vol, recon, known_offsets=known_offsets, progress_cb=progress_cb
             )
         )
+        self._flush_result_batch()
 
         if not recon.target_found:
             recon.messages.append(
@@ -1122,6 +1158,7 @@ class RecoveryEngine:
         recon: ReconstructionResult,
         *,
         known_offsets: Set[int],
+        progress_cb: ProgressCb = None,
     ) -> List[RecoveryItem]:
         unknown_root = self.output_dir / "Nieustalone_pochodzenie"
         items: List[RecoveryItem] = []
@@ -1132,6 +1169,9 @@ class RecoveryEngine:
         except Exception:
             return items
         target_cl = recon.target_cluster
+        shared_visited: Set[int] = {vol.bpb.root_cluster}
+        total = len([e for e in root_entries if not e.is_dot and not e.is_volume_label])
+        processed = 0
         for e in root_entries:
             if e.is_dot or e.is_volume_label:
                 continue
@@ -1142,12 +1182,15 @@ class RecoveryEngine:
             if e.cluster < 2:
                 continue
             if e.is_directory:
+                if e.cluster in shared_visited:
+                    continue
                 nodes = build_tree_from_directory(
                     vol,
                     e.cluster,
                     e.name,
                     belongs_to_target=False,
                     tracker=self.tracker,
+                    visited=shared_visited,
                 )
                 wrapper = RecoveredNode(
                     name=e.name,
@@ -1172,6 +1215,7 @@ class RecoveryEngine:
                         category="unknown",
                         known_offsets=known_offsets,
                         force_unknown_bucket=True,
+                        progress_cb=progress_cb,
                     )
                 )
             else:
@@ -1197,7 +1241,16 @@ class RecoveryEngine:
                         category="unknown",
                         known_offsets=known_offsets,
                         force_unknown_bucket=True,
+                        progress_cb=progress_cb,
                     )
+                )
+            processed += 1
+            if progress_cb:
+                pct = 66 + int(12 * processed / max(total, 1))
+                progress_cb(
+                    min(78, pct),
+                    f"Rekonstrukcja obiektów: {self._export_processed}/"
+                    f"{self._export_total} — {e.name}",
                 )
         return items
 
@@ -1210,6 +1263,7 @@ class RecoveryEngine:
         category: str,
         known_offsets: Set[int],
         force_unknown_bucket: bool = False,
+        progress_cb: ProgressCb = None,
     ) -> List[RecoveryItem]:
         items: List[RecoveryItem] = []
         unknown_base = self.output_dir / "Nieustalone_pochodzenie"
@@ -1218,6 +1272,26 @@ class RecoveryEngine:
             if self._cancelled():
                 raise InterruptedError("Anulowano")
             name = safe_filename(node.name)
+            entry = node.source_entry
+            object_key = (
+                ("entry", entry.raw_offset, node.is_directory)
+                if entry is not None
+                else (node.path, node.cluster, node.is_directory)
+            )
+            if object_key in self._export_seen_objects:
+                return
+            self._export_seen_objects.add(object_key)
+            self._persist_node(node)
+            self._export_processed += 1
+            if progress_cb:
+                pct = 55 + int(
+                    23 * self._export_processed / max(self._export_total, 1)
+                )
+                progress_cb(
+                    min(78, pct),
+                    f"Rekonstrukcja obiektów: {self._export_processed}/"
+                    f"{self._export_total} — {node.name}",
+                )
             already_under_unknown = unknown_base in parent_dir.parents or parent_dir == unknown_base
             if (
                 (force_unknown_bucket and not already_under_unknown)

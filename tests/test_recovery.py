@@ -60,3 +60,27 @@ def test_image_unchanged_after_recovery(fat32_image, tmp_path):
     finally:
         engine.close()
     assert path.read_bytes() == before
+
+
+def test_reconstruction_export_finishes_without_duplicate_objects(
+    fat32_image, tmp_path
+):
+    progress_messages = []
+    engine = RecoveryEngine(
+        fat32_image["path"], tmp_path / "export_progress",
+        enable_raw=False, deep_scan=True
+    )
+    try:
+        session = engine.run(
+            progress_cb=lambda _pct, message: progress_messages.append(message)
+        )
+    finally:
+        engine.close()
+
+    object_keys = [
+        (item.path, item.cluster, item.is_directory)
+        for item in session.items
+    ]
+    assert len(object_keys) == len(set(object_keys))
+    assert any("Rekonstrukcja obiektów:" in message for message in progress_messages)
+    assert progress_messages[-1] == "Gotowe"

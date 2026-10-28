@@ -82,6 +82,13 @@ więc przycisk **Odśwież wyniki** działa także podczas pauzy lub skanowania.
 Kandydat przekraczający budżet czasu, odczytów, klastrów albo rekordów trafia
 do `DEFERRED` i nie jest oznaczany jako nieodzyskiwalny.
 
+Etap eksportu używa wspólnego zbioru odwiedzonych klastrów i stabilnych
+identyfikatorów wpisów katalogowych. Dzięki temu katalog główny nie powoduje
+ponownego rozwijania tych samych drzew. Pasek etapu pokazuje liczbę
+przetworzonych obiektów oraz aktualną nazwę, a odczyty FAT/klastrów są
+raportowane jako wartości absolutne, nie sumowane wielokrotnie przy każdym
+heartbeat.
+
 Osierocone podfoldery z wpisem `..` wskazującym klaster katalogu docelowego
 (np. `1843110` dla `bhp szkoły`) są oznaczane osobno i eksportowane do
 `Odtworzony_bhp_szkoly/` z poziomem pewności „wysokie”.

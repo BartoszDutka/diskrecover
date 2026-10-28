@@ -264,3 +264,5 @@ def test_live_results_and_candidate_queue_are_durable(fat32_image, tmp_path):
 
     live = RecoveryEngine.load_live_results(db_path)
     assert live.items
+    assert live.stats["plikow_lacznie"] > 0
+    assert live.stats["w_docelowym"] > 0
