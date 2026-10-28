@@ -22,6 +22,41 @@ does not guarantee that the document's contents are complete or readable.
 No recovered document is opened by an office application, and no macros or
 active content are executed.
 
+## Screenshots
+
+The screenshots below are generated from the current PySide6 application
+window. The interface is intentionally dark and keeps source images
+read-only throughout the workflow.
+
+### Source and recovery settings
+
+Choose an image and output directory, optionally provide a target directory,
+and select RAW carving, deep scanning, or targeted recovery.
+
+![Source and recovery settings](docs/screenshots/source.png)
+
+### Scan progress
+
+The scan view reports overall and stage progress, telemetry, checkpoint state,
+and controls for pausing, resuming, saving, or cancelling a scan.
+
+![Scan progress](docs/screenshots/scan.png)
+
+### Recovery results
+
+Recovered objects are shown in a table with their source path, output path,
+size, confidence, and category. Results can be refreshed or exported without
+rescanning the image.
+
+![Recovery results](docs/screenshots/results.png)
+
+### Safety and capabilities
+
+The information view summarizes the non-destructive design and current
+filesystem support.
+
+![Safety and capabilities](docs/screenshots/about.png)
+
 ## Installation
 
 Python 3.10 or newer is required.
@@ -68,4 +103,3 @@ Use a forensic copy whenever possible. Recovery cannot guarantee complete
 content when metadata or data clusters have been overwritten. Do not treat
 validation as proof of semantic correctness. Physical-device support and
 in-place filesystem repair are deliberately not provided.
-
